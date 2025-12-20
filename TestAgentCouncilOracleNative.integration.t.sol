@@ -218,7 +218,7 @@ function test_RevertReveal_AlreadyRevealed_OneAgent_BecomesBadPhase() public {
     vm.prank(agentA);
     oracle.reveal(id, ans, nonce);
 
-    // second reveal attempt hits BadPhase() first
+    // second reveal attempt hits BadPhase() firstf
     vm.prank(agentA);
     vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
     oracle.reveal(id, ans, nonce);
