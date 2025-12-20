@@ -528,8 +528,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
 
     function distributeRewards(uint256 requestId) external override {
         RequestState storage s = _get(requestId);
-        if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
-        if (s.distributed) revert AlreadyDistributed();
+if (s.distributed) revert AlreadyDistributed();
+if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
+
 
         uint256 winnersLen = s.winners.length;
         if (winnersLen == 0) {
