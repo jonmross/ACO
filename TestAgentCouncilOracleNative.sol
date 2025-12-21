@@ -35,10 +35,6 @@ interface IAgentCouncilOracle {
     event RewardsDistributed(uint256 indexed requestId, address[] winners, uint256[] amounts);
     event ResolutionFailed(uint256 indexed requestId, string reason);
 
-    event DisputeInitiated(uint256 indexed requestId, address disputer, string reason);
-    event DisputeWindowOpened(uint256 indexed requestId, uint256 endTimestamp);
-    event DisputeResolved(uint256 indexed requestId, bool overturned, bytes finalAnswer);
-
     function createRequest(
         string calldata query,
         uint256 numInfoAgents,
@@ -65,15 +61,6 @@ interface IAgentCouncilOracle {
 
     function getResolution(uint256 requestId) external view returns (bytes memory finalAnswer, bool finalized);
 
-    function initiateDispute(uint256 requestId, string calldata reason) external payable;
-
-    function resolveDispute(
-        uint256 requestId,
-        bool overturn,
-        bytes calldata newAnswer,
-        address[] calldata newWinners
-    ) external;
-
     function getRequest(uint256 requestId) external view returns (Request memory);
 
     function getCommits(uint256 requestId) external view returns (address[] memory agents, bytes32[] memory commitments);
@@ -85,10 +72,15 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
     uint256 public constant REVEAL_WINDOW = 1 days;
 
     // -------------------------
-    // NEW: judge reward percent
+    // judge reward percent
     // -------------------------
     uint16 public constant BPS_DENOM = 10_000;
     uint16 public constant JUDGE_REWARD_BPS = 1_000; // 10% of rewardAmount
+
+    // -------------------------
+    // judge must aggregate within window (selection time + 1 day)
+    // -------------------------
+    uint256 public constant JUDGE_AGG_WINDOW = 1 days;
 
     enum Phase {
         None,
@@ -140,6 +132,11 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
 
         mapping(address => uint256) bondHeld;
         uint256 revealDeadline;
+
+        // judge bond state (posted AFTER selection; amount = agent bondAmount)
+        bool judgeBondPosted;
+        uint256 judgeBondHeld;
+        uint256 judgeAggDeadline;
     }
 
     uint256 private _nextRequestId = 1;
@@ -195,11 +192,18 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
     error RevealsStillOpen();
     error TooEarly();
 
-    // NEW: no revert strings on transfers
+    // no revert strings on transfers
     error RewardRefundFail();
     error BondRefundFail();
     error RewardPayFail();
     error RemainderFail();
+
+    // judge bond errors
+    error JudgeBondNotPosted();
+    error WrongJudgeBond();
+    error JudgeBondAlreadyPosted();
+    error JudgeBondRefundFail();
+    error JudgeBondPayFail();
 
     function _get(uint256 requestId) internal view returns (RequestState storage s) {
         s = _st[requestId];
@@ -454,12 +458,78 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         if (j == address(0)) revert NoJudgesRegistered();
 
         s.judge = j;
+
+        // judge must post bond AFTER being chosen; aggregate deadline starts now
+        s.judgeBondPosted = false;
+        s.judgeBondHeld = 0;
+        s.judgeAggDeadline = block.timestamp + JUDGE_AGG_WINDOW;
+
         s.phase = Phase.Judging;
         emit JudgeSelected(requestId, j);
     }
 
-    /// @notice If judgeSignupDeadline has passed and no judge was selected,
-    ///         fail the request and refund reward + all bonds. Callable by anyone.
+    // Judge posts bond AFTER being chosen. Bond = same as agent bondAmount.
+    function postJudgeBond(uint256 requestId) external payable {
+        RequestState storage s = _get(requestId);
+        if (s.phase != Phase.Judging) revert BadPhase();
+        if (msg.sender != s.judge) revert NotJudge();
+        if (s.judgeBondPosted) revert JudgeBondAlreadyPosted();
+        if (msg.value != s.req.bondAmount) revert WrongJudgeBond();
+
+        s.judgeBondPosted = true;
+        s.judgeBondHeld = msg.value;
+    }
+
+    // If judge doesn't aggregate within 1 day, refund reward+bonds and slash judge bond to requester+revealers.
+    function timeoutJudge(uint256 requestId) external {
+        RequestState storage s = _get(requestId);
+        if (s.phase != Phase.Judging) revert BadPhase();
+        if (s.finalized) revert AlreadyFinalized();
+        if (block.timestamp <= s.judgeAggDeadline) revert TooEarly();
+
+        s.phase = Phase.Failed;
+        emit ResolutionFailed(requestId, "JUDGE_TIMEOUT");
+
+        // refund reward to requester
+        uint256 reward = s.req.rewardAmount;
+        s.req.rewardAmount = 0;
+        if (reward > 0) {
+            (bool ok,) = s.req.requester.call{value: reward}("");
+            if (!ok) revert RewardRefundFail();
+        }
+
+        // refund all agent bonds
+        for (uint256 i = 0; i < s.commitAgents.length; i++) {
+            address a = s.commitAgents[i];
+            uint256 b = s.bondHeld[a];
+            if (b == 0) continue;
+            s.bondHeld[a] = 0;
+            (bool ok2,) = a.call{value: b}("");
+            if (!ok2) revert BondRefundFail();
+        }
+
+        // slash judge bond if posted: split among requester + revealAgents
+        uint256 jb = s.judgeBondHeld;
+        s.judgeBondHeld = 0;
+        s.judgeBondPosted = false;
+
+        if (jb > 0) {
+            uint256 n = s.revealAgents.length;
+            uint256 participants = 1 + n;
+            uint256 per = jb / participants;
+            uint256 rem = jb - (per * participants);
+
+            (bool okR,) = s.req.requester.call{value: per + rem}("");
+            if (!okR) revert JudgeBondPayFail();
+
+            for (uint256 i = 0; i < n; i++) {
+                (bool okA,) = s.revealAgents[i].call{value: per}("");
+                if (!okA) revert JudgeBondPayFail();
+            }
+        }
+    }
+
+    // If judgeSignupDeadline passes and no judge selected, refund reward + all bonds.
     function refundIfNoJudge(uint256 requestId) external {
         RequestState storage s = _get(requestId);
 
@@ -484,8 +554,8 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
             if (b == 0) continue;
 
             s.bondHeld[a] = 0;
-            (bool ok,) = a.call{value: b}("");
-            if (!ok) revert BondRefundFail();
+            (bool ok2,) = a.call{value: b}("");
+            if (!ok2) revert BondRefundFail();
         }
     }
 
@@ -499,6 +569,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         if (s.phase != Phase.Judging) revert BadPhase();
         if (s.finalized) revert AlreadyFinalized();
         if (msg.sender != s.judge) revert NotJudge();
+
+        // judge must have posted bond
+        if (!s.judgeBondPosted) revert JudgeBondNotPosted();
 
         uint256 commits = s.commitAgents.length;
         uint256 revealsCount = s.revealAgents.length;
@@ -528,14 +601,43 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
 
     function distributeRewards(uint256 requestId) external override {
         RequestState storage s = _get(requestId);
-if (s.distributed) revert AlreadyDistributed();
-if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
-
+        if (s.distributed) revert AlreadyDistributed();
+        if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
 
         uint256 winnersLen = s.winners.length;
         if (winnersLen == 0) {
+            // No winners: refund reward to requester, refund bonds to agents, refund judge bond to judge
             s.phase = Phase.Failed;
+            s.distributed = true;
             emit ResolutionFailed(requestId, "NO_WINNERS");
+
+            // Refund reward to requester
+            uint256 rewardRefund = s.req.rewardAmount;
+            s.req.rewardAmount = 0;
+            if (rewardRefund > 0) {
+                (bool ok,) = s.req.requester.call{value: rewardRefund}("");
+                if (!ok) revert RewardRefundFail();
+            }
+
+            // Refund all agent bonds
+            for (uint256 i = 0; i < s.commitAgents.length; i++) {
+                address a = s.commitAgents[i];
+                uint256 b = s.bondHeld[a];
+                if (b == 0) continue;
+                s.bondHeld[a] = 0;
+                (bool ok2,) = a.call{value: b}("");
+                if (!ok2) revert BondRefundFail();
+            }
+
+            // Refund judge bond to judge
+            uint256 judgeBondRefund = s.judgeBondHeld;
+            if (judgeBondRefund > 0) {
+                s.judgeBondHeld = 0;
+                s.judgeBondPosted = false;
+                (bool ok3,) = s.judge.call{value: judgeBondRefund}("");
+                if (!ok3) revert JudgeBondRefundFail();
+            }
+
             return;
         }
 
@@ -555,9 +657,6 @@ if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
             }
         }
 
-        // -------------------------
-        // NEW: judge gets % of reward
-        // -------------------------
         uint256 reward = s.req.rewardAmount;
         uint256 judgeCut = (reward * uint256(JUDGE_REWARD_BPS)) / uint256(BPS_DENOM);
 
@@ -566,9 +665,17 @@ if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
             if (!ok) revert RewardPayFail();
         }
 
+        // refund judge bond on success
+        uint256 jb = s.judgeBondHeld;
+        if (jb > 0) {
+            s.judgeBondHeld = 0;
+            s.judgeBondPosted = false;
+            (bool ok2,) = s.judge.call{value: jb}("");
+            if (!ok2) revert JudgeBondRefundFail();
+        }
+
         uint256 remainingReward = reward - judgeCut;
 
-        // Winners split remainingReward + loserBondSum
         uint256 pool = remainingReward + loserBondSum;
         uint256 perWinner = pool / winnersLen;
         uint256 remainder = pool - (perWinner * winnersLen);
@@ -578,13 +685,13 @@ if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
             address w = s.winners[i];
             amounts[i] = perWinner;
 
-            (bool ok,) = w.call{value: perWinner}("");
-            if (!ok) revert RewardPayFail();
+            (bool ok3,) = w.call{value: perWinner}("");
+            if (!ok3) revert RewardPayFail();
         }
 
         if (remainder > 0) {
-            (bool ok,) = s.req.requester.call{value: remainder}("");
-            if (!ok) revert RemainderFail();
+            (bool ok4,) = s.req.requester.call{value: remainder}("");
+            if (!ok4) revert RemainderFail();
         }
 
         s.distributed = true;
@@ -601,23 +708,6 @@ if (!s.finalized || s.phase != Phase.Finalized) revert BadPhase();
     {
         RequestState storage s = _get(requestId);
         return (s.finalAnswer, s.finalized);
-    }
-
-    function initiateDispute(uint256 requestId, string calldata reason) external payable override {
-        _get(requestId);
-        emit DisputeInitiated(requestId, msg.sender, reason);
-    }
-
-    function resolveDispute(
-        uint256 requestId,
-        bool overturn,
-        bytes calldata newAnswer,
-        address[] calldata /*newWinners*/
-    ) external override {
-        RequestState storage s = _get(requestId);
-        if (msg.sender != s.req.requester) revert NotJudge();
-        if (overturn) s.finalAnswer = newAnswer;
-        emit DisputeResolved(requestId, overturn, s.finalAnswer);
     }
 
     function getRequest(uint256 requestId) external view override returns (Request memory out) {
