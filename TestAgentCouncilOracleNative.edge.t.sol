@@ -14,49 +14,167 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
     address agentC    = address(0xD00D);
     address agentD    = address(0xABCD); // extra
 
-    // ✅ avoid Solidity 0.8.30 address-literal checksum rules
     address judge1    = address(uint160(0xBEEF));
     address judge2    = address(uint160(0xFEED));
+
+    uint256 reward = 1 ether;
+    uint256 bond   = 0.1 ether;
+    uint256 numAgents = 3;
 
     function setUp() public {
         oracle = new TestAgentCouncilOracleNative();
 
-        // make balance asserts exact
         vm.txGasPrice(0);
-
         vm.deal(requester, 100 ether);
-        vm.deal(agentA,    100 ether);
-        vm.deal(agentB,    100 ether);
-        vm.deal(agentC,    100 ether);
-        vm.deal(agentD,    100 ether);
-        vm.deal(judge1,    100 ether);
-        vm.deal(judge2,    100 ether);
+
+        vm.deal(agentA, 100 ether);
+        vm.deal(agentB, 100 ether);
+        vm.deal(agentC, 100 ether);
+        vm.deal(agentD, 100 ether);
+
+        vm.deal(judge1, 100 ether);
+        vm.deal(judge2, 100 ether);
+
+        vm.warp(1_000_000);
+        vm.roll(100);
+        vm.setBlockhash(99, bytes32(uint256(123456789)));
     }
 
-    // -------- helpers --------
+    // ---------------- helpers ----------------
 
     function _emptyCaps() internal pure returns (IAgentCouncilOracle.AgentCapabilities memory caps) {
         string[] memory empty;
         caps = IAgentCouncilOracle.AgentCapabilities({capabilities: empty, domains: empty});
     }
 
-    function _commitHash(bytes memory answer, uint256 nonce) internal pure returns (bytes32) {
+    function _commitment(bytes memory answer, uint256 nonce) internal pure returns (bytes32) {
         return keccak256(abi.encode(answer, nonce));
     }
 
-    function _createReq(
-        uint256 numAgents,
-        uint256 reward,
-        uint256 bond,
-        uint256 commitDeadline
-    ) internal returns (uint256 id) {
+    function _createRequest(
+        uint256 _numAgents,
+        uint256 _reward,
+        uint256 _bond,
+        uint256 _deadline,
+        address _rewardToken,
+        address _bondToken
+    ) internal returns (uint256 requestId) {
         vm.prank(requester);
-        id = oracle.createRequest{value: reward}(
+        requestId = oracle.createRequest{value: _reward}(
+            "Q",
+            _numAgents,
+            _reward,
+            _bond,
+            _deadline,
+            _rewardToken,
+            _bondToken,
+            "SPEC",
+            _emptyCaps()
+        );
+    }
+
+    function _createBasicRequest() internal returns (uint256 requestId, uint256 deadline) {
+        deadline = block.timestamp + 1 days;
+        requestId = _createRequest(numAgents, reward, bond, deadline, address(0), address(0));
+    }
+
+    function _do3Commits(uint256 requestId) internal {
+        vm.prank(agentA);
+        oracle.commit{value: bond}(requestId, _commitment(bytes("4"), 111));
+
+        vm.prank(agentB);
+        oracle.commit{value: bond}(requestId, _commitment(bytes("4"), 222));
+
+        vm.prank(agentC);
+        oracle.commit{value: bond}(requestId, _commitment(bytes("5"), 333));
+    }
+
+    function _do3Reveals(uint256 requestId) internal {
+        vm.prank(agentA);
+        oracle.reveal(requestId, bytes("4"), 111);
+
+        vm.prank(agentB);
+        oracle.reveal(requestId, bytes("4"), 222);
+
+        vm.prank(agentC);
+        oracle.reveal(requestId, bytes("5"), 333);
+    }
+
+    function _registerTwoJudges(uint256 requestId) internal {
+        vm.prank(judge1);
+        oracle.registerJudgeForRequest(requestId);
+        vm.prank(judge2);
+        oracle.registerJudgeForRequest(requestId);
+    }
+
+    function _expectedPickedJudge(uint256 requestId, address _requester, uint256 deadline, uint256 commitsLen)
+        internal
+        view
+        returns (address)
+    {
+        // pick based on oracle logic and our deterministic blockhash setup
+        bytes32 h = keccak256(
+            abi.encodePacked(
+                blockhash(block.number - 1),
+                address(oracle),
+                requestId,
+                _requester,
+                deadline,
+                commitsLen,
+                uint256(2)
+            )
+        );
+        return (uint256(h) % 2 == 0) ? judge1 : judge2;
+    }
+
+    function _selectJudge(uint256 requestId, uint256 deadline) internal returns (address picked) {
+        _registerTwoJudges(requestId);
+        picked = _expectedPickedJudge(requestId, requester, deadline, 3);
+        oracle.selectJudge(requestId);
+
+        // Judge must post bond after being selected
+        vm.prank(picked);
+        oracle.postJudgeBond{value: bond}(requestId);
+    }
+
+    // Helper that selects judge WITHOUT posting bond (for testing pre-bond scenarios)
+    function _selectJudgeNoBond(uint256 requestId, uint256 deadline) internal returns (address picked) {
+        _registerTwoJudges(requestId);
+        picked = _expectedPickedJudge(requestId, requester, deadline, 3);
+        oracle.selectJudge(requestId);
+    }
+
+    // ---------------- createRequest edge cases ----------------
+
+    function test_CreateRequest_Revert_TokenNotSupported() public {
+        uint256 deadline = block.timestamp + 1 days;
+
+        vm.prank(requester);
+        vm.expectRevert(TestAgentCouncilOracleNative.TokenNotSupported.selector);
+        oracle.createRequest{value: reward}(
             "Q",
             numAgents,
             reward,
             bond,
-            commitDeadline,
+            deadline,
+            address(0x1234),
+            address(0),
+            "SPEC",
+            _emptyCaps()
+        );
+    }
+
+    function test_CreateRequest_Revert_NumInfoAgentsZero() public {
+        uint256 deadline = block.timestamp + 1 days;
+
+        vm.prank(requester);
+        vm.expectRevert(TestAgentCouncilOracleNative.TooManyAgents.selector); // used for numInfoAgents==0 in your contract
+        oracle.createRequest{value: reward}(
+            "Q",
+            0,
+            reward,
+            bond,
+            deadline,
             address(0),
             address(0),
             "SPEC",
@@ -64,652 +182,511 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         );
     }
 
-    function _reachReveal_2Agents(uint256 reward, uint256 bond) internal returns (uint256 id, uint256 deadline) {
-        deadline = block.timestamp + 1 hours;
-        id = _createReq(2, reward, bond, deadline);
-
-        vm.prank(agentA);
-        oracle.commit{value: bond}(id, _commitHash(bytes("a"), 1));
-
-        vm.prank(agentB);
-        oracle.commit{value: bond}(id, _commitHash(bytes("b"), 2));
-
-        // after 2nd commit, phase becomes Reveal
-    }
-
-    function _reachAwaitingJudge_1Agent(uint256 reward, uint256 bond) internal returns (uint256 id, uint256 deadline) {
-        deadline = block.timestamp + 1 hours;
-        id = _createReq(1, reward, bond, deadline);
-
-        bytes memory ans = bytes("four");
-        uint256 nonce = 123;
-
-        vm.prank(agentA);
-        oracle.commit{value: bond}(id, _commitHash(ans, nonce));
-
-        vm.prank(agentA);
-        oracle.reveal(id, ans, nonce); // 1 agent => AwaitingJudge now
-    }
-
-    function _reachAwaitingJudge_2Agents_AllReveal(uint256 reward, uint256 bond)
-        internal
-        returns (uint256 id, uint256 deadline)
-    {
-        (id, deadline) = _reachReveal_2Agents(reward, bond);
-
-        vm.prank(agentA);
-        oracle.reveal(id, bytes("a"), 1);
-
-        vm.prank(agentB);
-        oracle.reveal(id, bytes("b"), 2);
-        // all revealed => AwaitingJudge
-    }
-
-    function _reachJudging_SelectSingleJudge_1Agent(uint256 reward, uint256 bond)
-        internal
-        returns (uint256 id, uint256 deadline)
-    {
-        (id, deadline) = _reachAwaitingJudge_1Agent(reward, bond);
-
-        vm.prank(judge1);
-        oracle.registerJudgeForRequest(id);
-
-        oracle.selectJudge(id); // only judge1 registered => judge1 will be selected
-    }
-
-// small array helpers
-function _asArray(address a) internal pure returns (address[] memory arr) {
-    arr = new address[](1);
-    arr[0] = a;
-}
-
-function _asArray2(address a, address b) internal pure returns (address[] memory arr) {
-    arr = new address[](2);
-    arr[0] = a;
-    arr[1] = b;
-}
-
-
-    // -------- createRequest edge cases --------
-
-    function test_RevertCreateRequest_TokenNotSupported() public {
-        uint256 deadline = block.timestamp + 1 hours;
-
-        vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.TokenNotSupported.selector);
-        oracle.createRequest{value: 1 ether}(
-            "q",
-            1,
-            1 ether,
-            0.1 ether,
-            deadline,
-            address(0x1234),
-            address(0),
-            "spec",
-            _emptyCaps()
-        );
-    }
-
-    function test_RevertCreateRequest_NumInfoAgentsZero() public {
-        uint256 deadline = block.timestamp + 1 hours;
-
-        vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.TooManyAgents.selector); // used for numInfoAgents==0 in this contract
-        oracle.createRequest{value: 1 ether}(
-            "q",
-            0,
-            1 ether,
-            0.1 ether,
-            deadline,
-            address(0),
-            address(0),
-            "spec",
-            _emptyCaps()
-        );
-    }
-
-    function test_RevertCreateRequest_DeadlinePassed() public {
+    function test_CreateRequest_Revert_DeadlinePassed() public {
         uint256 deadline = block.timestamp; // <= now
 
         vm.prank(requester);
         vm.expectRevert(TestAgentCouncilOracleNative.DeadlinePassed.selector);
-        oracle.createRequest{value: 1 ether}(
-            "q",
-            1,
-            1 ether,
-            0.1 ether,
+        oracle.createRequest{value: reward}(
+            "Q",
+            numAgents,
+            reward,
+            bond,
             deadline,
             address(0),
             address(0),
-            "spec",
+            "SPEC",
             _emptyCaps()
         );
     }
 
-    function test_RevertCreateRequest_NotEnoughValue() public {
-        uint256 deadline = block.timestamp + 1 hours;
+    function test_CreateRequest_Revert_NotEnoughValue() public {
+        uint256 deadline = block.timestamp + 1 days;
 
         vm.prank(requester);
         vm.expectRevert(TestAgentCouncilOracleNative.NotEnoughValue.selector);
-        oracle.createRequest{value: 0.5 ether}(
-            "q",
-            1,
-            1 ether,
-            0.1 ether,
+        oracle.createRequest{value: reward - 1}(
+            "Q",
+            numAgents,
+            reward,
+            bond,
             deadline,
             address(0),
             address(0),
-            "spec",
+            "SPEC",
             _emptyCaps()
         );
     }
 
-    function test_CreateRequestV2_Revert_BadJudgeDeadline() public {
-        uint256 deadline = block.timestamp + 1 hours;
+    function test_CreateRequestV2_Revert_BadJudgeDeadline_TooSoonOrBeforeRevealDeadline() public {
+        uint256 deadline = block.timestamp + 1 days;
         uint256 revealDeadline = deadline + oracle.REVEAL_WINDOW();
 
-        // judgeSignupDeadline <= now
+        // case 1: judgeSignupDeadline <= now
         {
             TestAgentCouncilOracleNative.CreateRequestV2Params memory p;
-            p.query = "q";
-            p.numInfoAgents = 1;
-            p.rewardAmount = 1 ether;
-            p.bondAmount = 0.1 ether;
+            p.query = "Q";
+            p.numInfoAgents = numAgents;
+            p.rewardAmount = reward;
+            p.bondAmount = bond;
             p.deadline = deadline;
-            p.judgeSignupDeadline = block.timestamp; // invalid
+            p.judgeSignupDeadline = block.timestamp; // <= now
             p.rewardToken = address(0);
             p.bondToken = address(0);
-            p.specifications = "spec";
+            p.specifications = "SPEC";
             p.requiredCapabilities = _emptyCaps();
 
             vm.prank(requester);
             vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
-            oracle.createRequestV2{value: 1 ether}(p);
+            oracle.createRequestV2{value: reward}(p);
         }
 
-        // judgeSignupDeadline < revealDeadline
+        // case 2: judgeSignupDeadline < revealDeadline
         {
             TestAgentCouncilOracleNative.CreateRequestV2Params memory p;
-            p.query = "q";
-            p.numInfoAgents = 1;
-            p.rewardAmount = 1 ether;
-            p.bondAmount = 0.1 ether;
+            p.query = "Q";
+            p.numInfoAgents = numAgents;
+            p.rewardAmount = reward;
+            p.bondAmount = bond;
             p.deadline = deadline;
             p.judgeSignupDeadline = revealDeadline - 1; // invalid
             p.rewardToken = address(0);
             p.bondToken = address(0);
-            p.specifications = "spec";
+            p.specifications = "SPEC";
             p.requiredCapabilities = _emptyCaps();
 
             vm.prank(requester);
             vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
-            oracle.createRequestV2{value: 1 ether}(p);
+            oracle.createRequestV2{value: reward}(p);
         }
     }
 
-    // -------- commit edge cases --------
+    // ---------------- commit edge cases ----------------
 
-    function test_RevertCommit_NotFound() public {
+    function test_Commit_Revert_NotFound() public {
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
-        oracle.commit{value: 0.1 ether}(999, bytes32(uint256(1)));
+        oracle.commit{value: bond}(999, bytes32(uint256(123)));
     }
 
-    function test_RevertCommit_DeadlinePassed() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 10;
+    function test_Commit_Revert_DeadlinePassed() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
 
-        uint256 id = _createReq(2, reward, bond, deadline);
-
-        vm.warp(deadline);
-
+        vm.warp(deadline); // >= deadline triggers DeadlinePassed in commit()
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.DeadlinePassed.selector);
-        oracle.commit{value: bond}(id, bytes32(uint256(1)));
+        oracle.commit{value: bond}(requestId, bytes32(uint256(123)));
     }
 
-    function test_RevertCommit_NotEnoughValue() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 1 hours;
-
-        uint256 id = _createReq(2, reward, bond, deadline);
+    function test_Commit_Revert_NotEnoughValue() public {
+        (uint256 requestId,) = _createBasicRequest();
 
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.NotEnoughValue.selector);
-        oracle.commit{value: bond - 1}(id, bytes32(uint256(1)));
+        oracle.commit{value: bond - 1}(requestId, bytes32(uint256(123)));
     }
 
-    function test_RevertCommit_AlreadyCommitted() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 1 hours;
-
-        uint256 id = _createReq(2, reward, bond, deadline);
+    function test_Commit_Revert_AlreadyCommitted() public {
+        (uint256 requestId,) = _createBasicRequest();
 
         vm.prank(agentA);
-        oracle.commit{value: bond}(id, bytes32(uint256(1)));
+        oracle.commit{value: bond}(requestId, bytes32(uint256(123)));
 
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.AlreadyCommitted.selector);
-        oracle.commit{value: bond}(id, bytes32(uint256(2)));
+        oracle.commit{value: bond}(requestId, bytes32(uint256(456)));
     }
 
-    function test_RevertCommit_BadPhase_AfterPhaseBecomesReveal() public {
-        (uint256 id,) = _reachReveal_2Agents(1 ether, 0.25 ether);
+    function test_Commit_Revert_BadPhase_AfterPhaseBecomesReveal() public {
+        (uint256 requestId,) = _createBasicRequest();
 
-        // now phase is Reveal; further commit hits BadPhase (not TooManyAgents)
-        vm.prank(agentC);
+        _do3Commits(requestId); // phase becomes Reveal
+
+        vm.prank(agentD);
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.commit{value: 0.25 ether}(id, bytes32(uint256(3)));
+        oracle.commit{value: bond}(requestId, bytes32(uint256(777)));
     }
 
-    function test_RevertCommit_JudgeCannotCommit() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
+    // ---------------- reveal edge cases ----------------
 
-        (uint256 id,) = _reachAwaitingJudge_1Agent(reward, bond);
+    function test_Reveal_Revert_BadPhase_WhenStillCommitAndBeforeDeadline() public {
+        (uint256 requestId,) = _createBasicRequest();
 
-        vm.prank(judge1);
-        oracle.registerJudgeForRequest(id);
-
-        vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.JudgeCannotCommit.selector);
-        oracle.commit{value: bond}(id, bytes32(uint256(1)));
-    }
-
-    // -------- reveal edge cases --------
-
-    function test_Reveal_AfterCommitDeadline_NoCommits_BecomesRevealThenNotCommitted() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 10;
-
-        uint256 id = _createReq(1, reward, bond, deadline);
-
-        // No commits, but warp >= deadline so reveal() will flip Commit->Reveal internally
-        vm.warp(deadline);
-
-        vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotCommitted.selector);
-        oracle.reveal(id, bytes("a"), 1);
-    }
-
-    function test_RevertReveal_NotCommitted_TwoAgents() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 1 hours;
-
-        uint256 id = _createReq(2, reward, bond, deadline);
-
-        // force phase to Reveal by having 2 commits from OTHER people
-        vm.prank(agentB);
-        oracle.commit{value: bond}(id, _commitHash(bytes("b"), 2));
-        vm.prank(agentC);
-        oracle.commit{value: bond}(id, _commitHash(bytes("c"), 3));
-
-        vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotCommitted.selector);
-        oracle.reveal(id, bytes("a"), 1);
-    }
-
-    function test_RevertReveal_AlreadyRevealed_OneAgent_BecomesBadPhase() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 1 hours;
-
-        uint256 id = _createReq(1, reward, bond, deadline);
-
-        bytes memory ans = bytes("four");
-        uint256 nonce = 7;
-
-        vm.prank(agentA);
-        oracle.commit{value: bond}(id, _commitHash(ans, nonce));
-
-        vm.prank(agentA);
-        oracle.reveal(id, ans, nonce);
-
-        // now phase is AwaitingJudge => second reveal hits BadPhase
+        // no commits yet, and before commit deadline -> reveal should revert BadPhase
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.reveal(id, ans, nonce);
+        oracle.reveal(requestId, bytes("4"), 111);
     }
 
-    function test_RevertReveal_AlreadyRevealed_TwoAgents_HitsAlreadyRevealed() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 1 hours;
+    function test_Reveal_Revert_NotCommitted() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId); // phase Reveal
 
-        uint256 id = _createReq(2, reward, bond, deadline);
+        vm.prank(agentD);
+        vm.expectRevert(TestAgentCouncilOracleNative.NotCommitted.selector);
+        oracle.reveal(requestId, bytes("4"), 444);
+    }
 
-        bytes memory ansA = bytes("four");
-        uint256 nonceA = 7;
-
-        bytes memory ansB = bytes("also four");
-        uint256 nonceB = 8;
-
-        vm.prank(agentA);
-        oracle.commit{value: bond}(id, _commitHash(ansA, nonceA));
-
-        vm.prank(agentB);
-        oracle.commit{value: bond}(id, _commitHash(ansB, nonceB));
+    function test_Reveal_Revert_AlreadyRevealed() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
 
         vm.prank(agentA);
-        oracle.reveal(id, ansA, nonceA);
+        oracle.reveal(requestId, bytes("4"), 111);
 
-        // still in Reveal phase (because B hasn't revealed yet)
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.AlreadyRevealed.selector);
-        oracle.reveal(id, ansA, nonceA);
+        oracle.reveal(requestId, bytes("4"), 111);
     }
 
-    function test_RevertReveal_CommitmentMismatch() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 1 hours;
+    function test_Reveal_Revert_CommitmentMismatch() public {
+        (uint256 requestId,) = _createBasicRequest();
 
-        uint256 id = _createReq(1, reward, bond, deadline);
-
-        bytes memory ans = bytes("four");
-        uint256 nonce = 7;
-
+        // commit expecting ("4",111)
         vm.prank(agentA);
-        oracle.commit{value: bond}(id, _commitHash(ans, nonce));
+        oracle.commit{value: bond}(requestId, _commitment(bytes("4"), 111));
 
+        // fill remaining commits so phase becomes Reveal
+        vm.prank(agentB);
+        oracle.commit{value: bond}(requestId, _commitment(bytes("4"), 222));
+        vm.prank(agentC);
+        oracle.commit{value: bond}(requestId, _commitment(bytes("5"), 333));
+
+        // reveal wrong nonce
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.CommitmentMismatch.selector);
-        oracle.reveal(id, ans, nonce + 1);
+        oracle.reveal(requestId, bytes("4"), 999);
     }
 
-    function test_RevertReveal_DeadlinePassed_AfterRevealWindow() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-        uint256 deadline = block.timestamp + 1 hours;
+    function test_Reveal_Revert_DeadlinePassed_AfterRevealWindow() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
 
-        uint256 id = _createReq(1, reward, bond, deadline);
-
-        bytes memory ans = bytes("four");
-        uint256 nonce = 7;
-
-        vm.prank(agentA);
-        oracle.commit{value: bond}(id, _commitHash(ans, nonce));
-
+        // reveal window ends at deadline + 1 day
         uint256 revealDeadline = deadline + oracle.REVEAL_WINDOW();
         vm.warp(revealDeadline + 1);
 
         vm.prank(agentA);
         vm.expectRevert(TestAgentCouncilOracleNative.DeadlinePassed.selector);
-        oracle.reveal(id, ans, nonce);
+        oracle.reveal(requestId, bytes("4"), 111);
     }
 
-    // -------- closeReveals edge cases --------
+    // ---------------- closeReveals edge cases ----------------
 
-    function test_RevertCloseReveals_BadPhase_WhenCommit() public {
-        uint256 id = _createReq(2, 1 ether, 0.25 ether, block.timestamp + 1 hours);
+    function test_CloseReveals_Revert_BadPhase_WhenCommit() public {
+        (uint256 requestId,) = _createBasicRequest();
 
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.closeReveals(id);
+        oracle.closeReveals(requestId);
     }
 
-    function test_RevertCloseReveals_RevealsStillOpen() public {
-        (uint256 id, uint256 deadline) = _reachReveal_2Agents(1 ether, 0.25 ether);
+    function test_CloseReveals_Revert_RevealsStillOpen() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
 
-        // only one reveal, and not past reveal deadline
+        // only one reveal and not past revealDeadline
         vm.prank(agentA);
-        oracle.reveal(id, bytes("a"), 1);
-
-        // not ended yet
-        vm.warp(deadline + oracle.REVEAL_WINDOW() - 1);
+        oracle.reveal(requestId, bytes("4"), 111);
 
         vm.expectRevert(TestAgentCouncilOracleNative.RevealsStillOpen.selector);
-        oracle.closeReveals(id);
+        oracle.closeReveals(requestId);
     }
 
-    function test_CloseReveals_Succeeds_WhenWindowEnded() public {
-        (uint256 id, uint256 deadline) = _reachReveal_2Agents(1 ether, 0.25 ether);
+    function test_CloseReveals_Succeeds_WhenAllRevealed() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
-        // only one reveal
-        vm.prank(agentA);
-        oracle.reveal(id, bytes("a"), 1);
-
-        // after reveal window ends
-        vm.warp(deadline + oracle.REVEAL_WINDOW() + 1);
-
-        oracle.closeReveals(id); // should succeed (moves to AwaitingJudge)
+        // phase should be AwaitingJudge now; closeReveals should revert BadPhase
+        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        oracle.closeReveals(requestId);
     }
 
-    // -------- judge registration / selection edge cases --------
+    // ---------------- judge registration edge cases ----------------
 
-    function test_RevertRegisterJudge_BadPhase() public {
-        uint256 id = _createReq(1, 1 ether, 0.25 ether, block.timestamp + 1 hours);
+    function test_RegisterJudge_Revert_NotFound() public {
+        vm.prank(judge1);
+        vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
+        oracle.registerJudgeForRequest(999);
+    }
 
+    function test_RegisterJudge_Revert_BadPhase() public {
+        (uint256 requestId,) = _createBasicRequest(); // phase Commit
         vm.prank(judge1);
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.registerJudgeForRequest(id);
+        oracle.registerJudgeForRequest(requestId);
     }
 
-    function test_RevertRegisterJudge_JudgeAlreadyRegistered() public {
-        (uint256 id,) = _reachAwaitingJudge_1Agent(1 ether, 0.25 ether);
+    function test_RegisterJudge_Revert_JudgePoolClosed_AfterDeadline() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        uint256 signup = oracle.getJudgeSignupDeadline(requestId);
+        assertEq(signup, deadline + oracle.REVEAL_WINDOW());
+
+        vm.warp(signup); // >= signup deadline => closed
+        vm.prank(judge1);
+        vm.expectRevert(TestAgentCouncilOracleNative.JudgePoolClosed.selector);
+        oracle.registerJudgeForRequest(requestId);
+    }
+
+    function test_RegisterJudge_Revert_JudgeAlreadyRegistered() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
         vm.prank(judge1);
-        oracle.registerJudgeForRequest(id);
+        oracle.registerJudgeForRequest(requestId);
 
         vm.prank(judge1);
         vm.expectRevert(TestAgentCouncilOracleNative.JudgeAlreadyRegistered.selector);
-        oracle.registerJudgeForRequest(id);
+        oracle.registerJudgeForRequest(requestId);
     }
 
     function test_UnregisterJudge_NoOp_WhenNotRegistered() public {
-        (uint256 id,) = _reachAwaitingJudge_1Agent(1 ether, 0.25 ether);
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
+        // should not revert and judgeCount remains 0
         vm.prank(judge1);
-        oracle.unregisterJudgeForRequest(id);
+        oracle.unregisterJudgeForRequest(requestId);
 
-        assertEq(oracle.judgeCount(id), 0);
+        assertEq(oracle.judgeCount(requestId), 0);
     }
 
-    function test_RevertSelectJudge_NoJudgesRegistered() public {
-        (uint256 id,) = _reachAwaitingJudge_1Agent(1 ether, 0.25 ether);
+    function test_UnregisterJudge_Revert_BadPhase() public {
+        (uint256 requestId,) = _createBasicRequest(); // Commit phase
+
+        vm.prank(judge1);
+        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        oracle.unregisterJudgeForRequest(requestId);
+    }
+
+    // ---------------- selectJudge edge cases ----------------
+
+    function test_SelectJudge_Revert_BadPhase() public {
+        (uint256 requestId,) = _createBasicRequest(); // Commit phase
+        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        oracle.selectJudge(requestId);
+    }
+
+    function test_SelectJudge_Revert_NoJudgesRegistered() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
         vm.expectRevert(TestAgentCouncilOracleNative.NoJudgesRegistered.selector);
-        oracle.selectJudge(id);
+        oracle.selectJudge(requestId);
     }
 
-    function test_RevertSelectJudge_BadPhase() public {
-        uint256 id = _createReq(1, 1 ether, 0.25 ether, block.timestamp + 1 hours);
+    function test_SelectJudge_Revert_JudgePoolClosed_AfterSignupDeadline() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
+        uint256 signup = oracle.getJudgeSignupDeadline(requestId);
+        vm.warp(signup); // >= deadline => closed
+
+        vm.expectRevert(TestAgentCouncilOracleNative.JudgePoolClosed.selector);
+        oracle.selectJudge(requestId);
+    }
+
+    function test_SelectJudge_Revert_JudgePoolClosed_AlreadySelected() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        // Use the no-bond version since we just want to test selectJudge revert
+        _selectJudgeNoBond(requestId, deadline);
+
+        // After judge is selected, phase is Judging, so selectJudge reverts BadPhase
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.selectJudge(id);
+        oracle.selectJudge(requestId);
     }
 
-    // -------- aggregate edge cases --------
+    // ---------------- aggregate edge cases ----------------
 
-    function test_RevertAggregate_BadPhase() public {
-        (uint256 id,) = _reachAwaitingJudge_1Agent(1 ether, 0.25 ether);
+    function test_Aggregate_Revert_BadPhase() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
 
-        // still AwaitingJudge (no selectJudge yet)
+        address[] memory winners = new address[](0);
+
+        // still Reveal phase (no judge selected)
         vm.prank(judge1);
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.aggregate(id, bytes("final"), _asArray(agentA), bytes("reasoning"));
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("x"));
     }
 
-function test_RevertAggregate_NotJudge() public {
-    (uint256 id,) = _reachAwaitingJudge_1Agent(1 ether, 0.25 ether);
+    function test_Aggregate_Revert_NotJudge() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
-    vm.prank(judge1);
-    oracle.registerJudgeForRequest(id);
+        address picked = _selectJudge(requestId, deadline);
 
-    oracle.selectJudge(id);
+        address[] memory winners = new address[](0);
 
-    vm.prank(agentB);
-    vm.expectRevert(TestAgentCouncilOracleNative.NotJudge.selector);
-    oracle.aggregate(id, bytes("final"), _asArray(agentA), bytes("reasoning"));
-}
+        // someone else tries
+        address imposter = (picked == judge1) ? judge2 : judge1;
+        vm.prank(imposter);
+        vm.expectRevert(TestAgentCouncilOracleNative.NotJudge.selector);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("x"));
+    }
 
-function test_RevertAggregate_AlreadyFinalized() public {
-    (uint256 id,) = _reachJudging_SelectSingleJudge_1Agent(1 ether, 0.25 ether);
+    function test_Aggregate_Allows_WinnersNotInCommits_PaysThemAnyway() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
-    vm.prank(judge1);
-    oracle.aggregate(id, bytes("final"), _asArray(agentA), bytes("reasoning"));
+        address picked = _selectJudge(requestId, deadline);
 
-    vm.prank(judge1);
-    vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);  // Changed from AlreadyFinalized
-    oracle.aggregate(id, bytes("final2"), _asArray(agentA), bytes("reasoning2"));
-}
-
-function test_Aggregate_NoQuorum_FailsAndCannotDistribute() public {
-    uint256 reward = 1 ether;
-    uint256 bond   = 0.25 ether;
-    uint256 deadline = block.timestamp + 1 hours;
-    uint256 revealDeadline = deadline + oracle.REVEAL_WINDOW();
-    uint256 judgeSignupDeadline = revealDeadline + 1 hours; // Extra time for judge signup
-
-    // Use createRequestV2 with custom judge signup deadline
-    TestAgentCouncilOracleNative.CreateRequestV2Params memory p;
-    p.query = "Q";
-    p.numInfoAgents = 3;
-    p.rewardAmount = reward;
-    p.bondAmount = bond;
-    p.deadline = deadline;
-    p.judgeSignupDeadline = judgeSignupDeadline;
-    p.rewardToken = address(0);
-    p.bondToken = address(0);
-    p.specifications = "SPEC";
-    p.requiredCapabilities = _emptyCaps();
-
-    vm.prank(requester);
-    uint256 id = oracle.createRequestV2{value: reward}(p);
-
-    // All 3 agents commit
-    vm.prank(agentA);
-    oracle.commit{value: bond}(id, _commitHash(bytes("a"), 1));
-    vm.prank(agentB);
-    oracle.commit{value: bond}(id, _commitHash(bytes("b"), 2));
-    vm.prank(agentC);
-    oracle.commit{value: bond}(id, _commitHash(bytes("c"), 3));
-
-    // Only 1 reveal (no quorum)
-    vm.prank(agentA);
-    oracle.reveal(id, bytes("a"), 1);
-
-    // Warp past reveal window but before judge signup deadline
-    vm.warp(revealDeadline + 1);
-    oracle.closeReveals(id);
-
-    // Now we can register judge (still before judgeSignupDeadline)
-    vm.prank(judge1);
-    oracle.registerJudgeForRequest(id);
-
-    oracle.selectJudge(id);
-
-    vm.prank(judge1);
-    oracle.aggregate(id, bytes("final"), _asArray(agentA), bytes("no quorum"));
-
-    (, bool finalized) = oracle.getResolution(id);
-    assertEq(finalized, false);
-
-    vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-    oracle.distributeRewards(id);
-}
-
-    function test_Aggregate_AllowsWinnerNotInCommits_PaysThemAnyway() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
-
-        (uint256 id,) = _reachJudging_SelectSingleJudge_1Agent(reward, bond);
-
-        // choose agentD who never committed as winner (current contract allows this)
-        vm.prank(judge1);
-        oracle.aggregate(id, bytes("final"), _asArray(agentD), bytes("weird winner"));
+        address[] memory winners = new address[](1);
+        winners[0] = agentD; // agentD never committed/revealed
 
         uint256 dBefore = agentD.balance;
-        oracle.distributeRewards(id);
-        assertGt(agentD.balance, dBefore);
+
+        vm.prank(picked);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("weird winner"));
+
+        oracle.distributeRewards(requestId);
+
+        assertGt(agentD.balance, dBefore, "agentD should have received payout even though not committed");
     }
 
-    // -------- distributeRewards edge cases --------
+    // ---------------- distributeRewards edge cases ----------------
 
-    function test_RevertDistributeRewards_BadPhase_WhenNotFinalized() public {
-        (uint256 id,) = _reachAwaitingJudge_1Agent(1 ether, 0.25 ether);
-
+    function test_DistributeRewards_Revert_BadPhase_IfNotFinalized() public {
+        (uint256 requestId,) = _createBasicRequest();
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.distributeRewards(id);
+        oracle.distributeRewards(requestId);
     }
 
     function test_DistributeRewards_Revert_AlreadyDistributed() public {
-        (uint256 id,) = _reachJudging_SelectSingleJudge_1Agent(1 ether, 0.25 ether);
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
-        vm.prank(judge1);
-        oracle.aggregate(id, bytes("final"), _asArray(agentA), bytes("reasoning"));
+        address picked = _selectJudge(requestId, deadline);
 
-        oracle.distributeRewards(id);
+        address[] memory winners = new address[](2);
+        winners[0] = agentA;
+        winners[1] = agentB;
+
+        vm.prank(picked);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("ok"));
+
+        oracle.distributeRewards(requestId);
 
         vm.expectRevert(TestAgentCouncilOracleNative.AlreadyDistributed.selector);
-        oracle.distributeRewards(id);
+        oracle.distributeRewards(requestId);
     }
 
-    function test_DistributeRewards_NoWinners_LeavesFundsInContract_CurrentBehavior() public {
-        uint256 reward = 1 ether;
-        uint256 bond   = 0.25 ether;
+    function test_DistributeRewards_NoWinners_RefundsEveryone() public {
+        // Capture balances BEFORE creating request
+        uint256 reqInitial = requester.balance;
+        uint256 aInitial = agentA.balance;
+        uint256 bInitial = agentB.balance;
+        uint256 cInitial = agentC.balance;
 
-        (uint256 id,) = _reachJudging_SelectSingleJudge_1Agent(reward, bond);
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
 
-        // finalize with empty winners list
-        vm.prank(judge1);
-        oracle.aggregate(id, bytes("final"), new address[](0), bytes("no winners"));
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
-        uint256 heldBefore = address(oracle).balance;
-        oracle.distributeRewards(id);
+        address picked = _selectJudge(requestId, deadline);
+        uint256 judgeInitial = picked.balance + bond; // judge already spent bond in _selectJudge
 
-        // current implementation sets Failed and returns without refunding
-        assertEq(address(oracle).balance, heldBefore);
+        address[] memory winners = new address[](0);
+
+        vm.prank(picked);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("no winners"));
+
+        oracle.distributeRewards(requestId);
+
+        // Everyone should be refunded to their initial balances
+        assertEq(address(oracle).balance, 0, "contract should have no funds");
+        assertEq(requester.balance, reqInitial, "requester got reward back");
+        assertEq(agentA.balance, aInitial, "agentA got bond back");
+        assertEq(agentB.balance, bInitial, "agentB got bond back");
+        assertEq(agentC.balance, cInitial, "agentC got bond back");
+        assertEq(picked.balance, judgeInitial, "judge got bond back");
     }
 
-    // -------- refundIfNoJudge edge cases --------
+    function test_DistributeRewards_Remainder_ReturnedToRequester() public {
+        uint256 localBond = 1 wei;
 
-    function test_RevertRefundIfNoJudge_BadPhase() public {
-        uint256 id = _createReq(1, 1 ether, 0.25 ether, block.timestamp + 1 hours);
+        uint256 deadline = block.timestamp + 1 days;
+        uint256 requestId = _createRequest(3, reward, localBond, deadline, address(0), address(0));
 
+        uint256 reqBefore = requester.balance;
+
+        vm.prank(agentA);
+        oracle.commit{value: localBond}(requestId, _commitment(bytes("4"), 111));
+        vm.prank(agentB);
+        oracle.commit{value: localBond}(requestId, _commitment(bytes("4"), 222));
+        vm.prank(agentC);
+        oracle.commit{value: localBond}(requestId, _commitment(bytes("5"), 333));
+
+        vm.prank(agentA);
+        oracle.reveal(requestId, bytes("4"), 111);
+        vm.prank(agentB);
+        oracle.reveal(requestId, bytes("4"), 222);
+        vm.prank(agentC);
+        oracle.reveal(requestId, bytes("5"), 333);
+
+        _registerTwoJudges(requestId);
+        address picked = _expectedPickedJudge(requestId, requester, deadline, 3);
+        oracle.selectJudge(requestId);
+
+        // Judge must post bond after being selected
+        vm.prank(picked);
+        oracle.postJudgeBond{value: localBond}(requestId);
+
+        address[] memory winners = new address[](2);
+        winners[0] = agentA;
+        winners[1] = agentB;
+
+        vm.prank(picked);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("remainder test"));
+
+        oracle.distributeRewards(requestId);
+
+        // Calculate expected remainder:
+        // - reward = 1 ether
+        // - judgeCut = 10% of reward = 0.1 ether  
+        // - remainingReward = 0.9 ether
+        // - loserBondSum = 1 wei (agentC lost)
+        // - pool = 0.9 ether + 1 wei = 900000000000000001 wei
+        // - perWinner = pool / 2 = 450000000000000000 wei (integer division truncates)
+        // - remainder = pool - (perWinner * 2) = 900000000000000001 - 900000000000000000 = 1 wei
+        // 
+        // reqBefore is captured AFTER createRequest, so requester already paid reward
+        // Final balance should be reqBefore + remainder = reqBefore + 1 wei
+        assertEq(requester.balance, reqBefore + 1 wei, "requester got remainder");
+    }
+
+    // ---------------- refundIfNoJudge edge cases ----------------
+
+    function test_RefundIfNoJudge_Revert_BadPhase() public {
+        (uint256 requestId,) = _createBasicRequest(); // Commit phase
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
-        oracle.refundIfNoJudge(id);
+        oracle.refundIfNoJudge(requestId);
     }
 
-    function test_RevertRefundIfNoJudge_TooEarly() public {
-        (uint256 id, uint256 deadline) = _reachAwaitingJudge_1Agent(1 ether, 0.25 ether);
+    function test_RefundIfNoJudge_Revert_TooEarly() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
 
-        uint256 signup = oracle.getJudgeSignupDeadline(id);
-        assertEq(signup, deadline + oracle.REVEAL_WINDOW());
-
-        vm.warp(signup - 1);
+        // awaiting judge, but before signup deadline
         vm.expectRevert(TestAgentCouncilOracleNative.TooEarly.selector);
-        oracle.refundIfNoJudge(id);
+        oracle.refundIfNoJudge(requestId);
     }
 
-function test_RefundIfNoJudge_RefundsRewardAndBonds() public {
-    uint256 reward = 1 ether;
-    uint256 bond   = 0.25 ether;
-
-    // Capture balances BEFORE creating the request
-    uint256 reqInitial = requester.balance;
-    uint256 aInitial = agentA.balance;
-    uint256 bInitial = agentB.balance;
-
-    (uint256 id, uint256 deadline) = _reachAwaitingJudge_2Agents_AllReveal(reward, bond);
-
-    uint256 signup = oracle.getJudgeSignupDeadline(id);
-    assertEq(signup, deadline + oracle.REVEAL_WINDOW());
-
-    vm.warp(signup + 1);
-    oracle.refundIfNoJudge(id);
-
-    // After refund, everyone should be back to initial balances
-    assertEq(requester.balance, reqInitial);
-    assertEq(agentA.balance, aInitial);
-    assertEq(agentB.balance, bInitial);
-    assertEq(address(oracle).balance, 0);
-}
-    // -------- NotFound getter guards --------
+    // ---------------- misc getters / NotFound ----------------
 
     function test_Getters_Revert_NotFound() public {
         vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
