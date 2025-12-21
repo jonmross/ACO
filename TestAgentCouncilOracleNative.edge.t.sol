@@ -358,6 +358,58 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.reveal(requestId, bytes("4"), 999);
     }
 
+        function test_Reveal_Revert_AlreadyRevealed_OneAgent_BecomesBadPhase() public {
+        uint256 deadline = block.timestamp + 1 hours;
+        
+        // 1 agent => after first reveal, phase becomes AwaitingJudge
+        uint256 requestId = _createRequest(1, reward, bond, deadline, address(0), address(0));
+
+        bytes memory ans = bytes("four");
+        uint256 nonce = 7;
+        bytes32 h = _commitment(ans, nonce);
+
+        vm.prank(agentA);
+        oracle.commit{value: bond}(requestId, h);
+
+        vm.prank(agentA);
+        oracle.reveal(requestId, ans, nonce);
+
+        // second reveal attempt hits BadPhase() first
+        vm.prank(agentA);
+        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        oracle.reveal(requestId, ans, nonce);
+    }
+
+    function test_Reveal_Revert_AlreadyRevealed_TwoAgents_HitsAlreadyRevealed() public {
+        uint256 deadline = block.timestamp + 1 hours;
+
+        // 2 agents => after A reveals, phase stays Reveal until B reveals (or window closes)
+        uint256 requestId = _createRequest(2, reward, bond, deadline, address(0), address(0));
+
+        bytes memory ansA = bytes("four");
+        uint256 nonceA = 7;
+        bytes32 hA = _commitment(ansA, nonceA);
+
+        bytes memory ansB = bytes("also four");
+        uint256 nonceB = 8;
+        bytes32 hB = _commitment(ansB, nonceB);
+
+        vm.prank(agentA);
+        oracle.commit{value: bond}(requestId, hA);
+
+        vm.prank(agentB);
+        oracle.commit{value: bond}(requestId, hB);
+
+        vm.prank(agentA);
+        oracle.reveal(requestId, ansA, nonceA);
+
+        // second reveal attempt now reaches AlreadyRevealed()
+        vm.prank(agentA);
+        vm.expectRevert(TestAgentCouncilOracleNative.AlreadyRevealed.selector);
+        oracle.reveal(requestId, ansA, nonceA);
+    }
+
+
     function test_Reveal_Revert_DeadlinePassed_AfterRevealWindow() public {
         (uint256 requestId, uint256 deadline) = _createBasicRequest();
         _do3Commits(requestId);
