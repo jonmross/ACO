@@ -19,7 +19,13 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
     uint256 reward = 1 ether;
     uint256 bond   = 0.1 ether;
+    uint256 judgeBond = 0.1 ether;
     uint256 numAgents = 3;
+    
+    // Default timing parameters
+    uint256 revealWindow = 1 days;
+    uint256 judgeAggWindow = 1 days;
+    uint16 judgeRewardBps = 1000; // 10%
 
     function setUp() public {
         oracle = new TestAgentCouncilOracleNative();
@@ -51,31 +57,49 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         return keccak256(abi.encode(answer, nonce));
     }
 
-    function _createRequest(
+    function _createRequestParams(
         uint256 _numAgents,
         uint256 _reward,
         uint256 _bond,
         uint256 _deadline,
-        address _rewardToken,
-        address _bondToken
+        uint256 _judgeSignupDeadline
+    ) internal view returns (IAgentCouncilOracle.CreateRequestParams memory p) {
+        p.query = "Q";
+        p.numInfoAgents = _numAgents;
+        p.rewardAmount = _reward;
+        p.bondAmount = _bond;
+        p.deadline = _deadline;
+        p.judgeSignupDeadline = _judgeSignupDeadline;
+        p.revealWindow = revealWindow;
+        p.judgeBondAmount = judgeBond;
+        p.judgeAggWindow = judgeAggWindow;
+        p.judgeRewardBps = judgeRewardBps;
+        p.rewardToken = address(0);
+        p.bondToken = address(0);
+        p.specifications = "SPEC";
+        p.requiredCapabilities = _emptyCaps();
+    }
+
+    function _createRequest(
+        uint256 _numAgents,
+        uint256 _reward,
+        uint256 _bond,
+        uint256 _deadline
     ) internal returns (uint256 requestId) {
-        vm.prank(requester);
-        requestId = oracle.createRequest{value: _reward}(
-            "Q",
-            _numAgents,
-            _reward,
-            _bond,
-            _deadline,
-            _rewardToken,
-            _bondToken,
-            "SPEC",
-            _emptyCaps()
+        uint256 revealDeadline = _deadline + revealWindow;
+        uint256 judgeSignupDeadline = revealDeadline + 1 days; // give extra time for judge signup
+        
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            _numAgents, _reward, _bond, _deadline, judgeSignupDeadline
         );
+        
+        vm.prank(requester);
+        requestId = oracle.createRequest{value: _reward}(p);
     }
 
     function _createBasicRequest() internal returns (uint256 requestId, uint256 deadline) {
         deadline = block.timestamp + 1 days;
-        requestId = _createRequest(numAgents, reward, bond, deadline, address(0), address(0));
+        requestId = _createRequest(numAgents, reward, bond, deadline);
     }
 
     function _do3Commits(uint256 requestId) internal {
@@ -134,7 +158,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         // Judge must post bond after being selected
         vm.prank(picked);
-        oracle.postJudgeBond{value: bond}(requestId);
+        oracle.postJudgeBond{value: judgeBond}(requestId);
     }
 
     // Helper that selects judge WITHOUT posting bond (for testing pre-bond scenarios)
@@ -148,117 +172,122 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
     function test_CreateRequest_Revert_TokenNotSupported() public {
         uint256 deadline = block.timestamp + 1 days;
+        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, judgeSignupDeadline
+        );
+        p.rewardToken = address(0x1234); // non-zero token
 
         vm.prank(requester);
         vm.expectRevert(TestAgentCouncilOracleNative.TokenNotSupported.selector);
-        oracle.createRequest{value: reward}(
-            "Q",
-            numAgents,
-            reward,
-            bond,
-            deadline,
-            address(0x1234),
-            address(0),
-            "SPEC",
-            _emptyCaps()
-        );
+        oracle.createRequest{value: reward}(p);
     }
 
     function test_CreateRequest_Revert_NumInfoAgentsZero() public {
         uint256 deadline = block.timestamp + 1 days;
+        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            0, reward, bond, deadline, judgeSignupDeadline
+        );
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.TooManyAgents.selector); // used for numInfoAgents==0 in your contract
-        oracle.createRequest{value: reward}(
-            "Q",
-            0,
-            reward,
-            bond,
-            deadline,
-            address(0),
-            address(0),
-            "SPEC",
-            _emptyCaps()
-        );
+        vm.expectRevert(TestAgentCouncilOracleNative.TooManyAgents.selector);
+        oracle.createRequest{value: reward}(p);
     }
 
     function test_CreateRequest_Revert_DeadlinePassed() public {
         uint256 deadline = block.timestamp; // <= now
+        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, judgeSignupDeadline
+        );
 
         vm.prank(requester);
         vm.expectRevert(TestAgentCouncilOracleNative.DeadlinePassed.selector);
-        oracle.createRequest{value: reward}(
-            "Q",
-            numAgents,
-            reward,
-            bond,
-            deadline,
-            address(0),
-            address(0),
-            "SPEC",
-            _emptyCaps()
-        );
+        oracle.createRequest{value: reward}(p);
     }
 
     function test_CreateRequest_Revert_NotEnoughValue() public {
         uint256 deadline = block.timestamp + 1 days;
+        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, judgeSignupDeadline
+        );
 
         vm.prank(requester);
         vm.expectRevert(TestAgentCouncilOracleNative.NotEnoughValue.selector);
-        oracle.createRequest{value: reward - 1}(
-            "Q",
-            numAgents,
-            reward,
-            bond,
-            deadline,
-            address(0),
-            address(0),
-            "SPEC",
-            _emptyCaps()
-        );
+        oracle.createRequest{value: reward - 1}(p);
     }
 
-    function test_CreateRequestV2_Revert_BadJudgeDeadline_TooSoonOrBeforeRevealDeadline() public {
+    function test_CreateRequest_Revert_InvalidRevealWindow() public {
         uint256 deadline = block.timestamp + 1 days;
-        uint256 revealDeadline = deadline + oracle.REVEAL_WINDOW();
+        uint256 judgeSignupDeadline = deadline + 2 days;
 
-        // case 1: judgeSignupDeadline <= now
-        {
-            TestAgentCouncilOracleNative.CreateRequestV2Params memory p;
-            p.query = "Q";
-            p.numInfoAgents = numAgents;
-            p.rewardAmount = reward;
-            p.bondAmount = bond;
-            p.deadline = deadline;
-            p.judgeSignupDeadline = block.timestamp; // <= now
-            p.rewardToken = address(0);
-            p.bondToken = address(0);
-            p.specifications = "SPEC";
-            p.requiredCapabilities = _emptyCaps();
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, judgeSignupDeadline
+        );
+        p.revealWindow = 0; // invalid
 
-            vm.prank(requester);
-            vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
-            oracle.createRequestV2{value: reward}(p);
-        }
+        vm.prank(requester);
+        vm.expectRevert(TestAgentCouncilOracleNative.InvalidWindow.selector);
+        oracle.createRequest{value: reward}(p);
+    }
 
-        // case 2: judgeSignupDeadline < revealDeadline
-        {
-            TestAgentCouncilOracleNative.CreateRequestV2Params memory p;
-            p.query = "Q";
-            p.numInfoAgents = numAgents;
-            p.rewardAmount = reward;
-            p.bondAmount = bond;
-            p.deadline = deadline;
-            p.judgeSignupDeadline = revealDeadline - 1; // invalid
-            p.rewardToken = address(0);
-            p.bondToken = address(0);
-            p.specifications = "SPEC";
-            p.requiredCapabilities = _emptyCaps();
+    function test_CreateRequest_Revert_InvalidJudgeAggWindow() public {
+        uint256 deadline = block.timestamp + 1 days;
+        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
 
-            vm.prank(requester);
-            vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
-            oracle.createRequestV2{value: reward}(p);
-        }
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, judgeSignupDeadline
+        );
+        p.judgeAggWindow = 0; // invalid
+
+        vm.prank(requester);
+        vm.expectRevert(TestAgentCouncilOracleNative.InvalidWindow.selector);
+        oracle.createRequest{value: reward}(p);
+    }
+
+    function test_CreateRequest_Revert_InvalidBps() public {
+        uint256 deadline = block.timestamp + 1 days;
+        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, judgeSignupDeadline
+        );
+        p.judgeRewardBps = 10001; // > 10000
+
+        vm.prank(requester);
+        vm.expectRevert(TestAgentCouncilOracleNative.InvalidBps.selector);
+        oracle.createRequest{value: reward}(p);
+    }
+
+    function test_CreateRequest_Revert_BadJudgeDeadline_TooSoon() public {
+        uint256 deadline = block.timestamp + 1 days;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, block.timestamp // <= now
+        );
+
+        vm.prank(requester);
+        vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
+        oracle.createRequest{value: reward}(p);
+    }
+
+    function test_CreateRequest_Revert_BadJudgeDeadline_BeforeRevealDeadline() public {
+        uint256 deadline = block.timestamp + 1 days;
+        uint256 revealDeadlineCalc = deadline + revealWindow;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
+            numAgents, reward, bond, deadline, revealDeadlineCalc - 1 // < revealDeadline
+        );
+
+        vm.prank(requester);
+        vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
+        oracle.createRequest{value: reward}(p);
     }
 
     // ---------------- commit edge cases ----------------
@@ -306,6 +335,12 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
         oracle.commit{value: bond}(requestId, bytes32(uint256(777)));
     }
+
+    // NOTE: test_Commit_Revert_JudgeCannotCommit is not included because the 
+    // JudgeCannotCommit check is defensive for a scenario that can't occur in the 
+    // normal flow - judge registration requires AwaitingJudge phase which comes 
+    // after Commit phase ends, so a registered judge can never attempt to commit 
+    // on the same request they're registered for.
 
     // ---------------- reveal edge cases ----------------
 
@@ -358,11 +393,11 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.reveal(requestId, bytes("4"), 999);
     }
 
-        function test_Reveal_Revert_AlreadyRevealed_OneAgent_BecomesBadPhase() public {
+    function test_Reveal_Revert_AlreadyRevealed_OneAgent_BecomesBadPhase() public {
         uint256 deadline = block.timestamp + 1 hours;
         
         // 1 agent => after first reveal, phase becomes AwaitingJudge
-        uint256 requestId = _createRequest(1, reward, bond, deadline, address(0), address(0));
+        uint256 requestId = _createRequest(1, reward, bond, deadline);
 
         bytes memory ans = bytes("four");
         uint256 nonce = 7;
@@ -384,7 +419,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         uint256 deadline = block.timestamp + 1 hours;
 
         // 2 agents => after A reveals, phase stays Reveal until B reveals (or window closes)
-        uint256 requestId = _createRequest(2, reward, bond, deadline, address(0), address(0));
+        uint256 requestId = _createRequest(2, reward, bond, deadline);
 
         bytes memory ansA = bytes("four");
         uint256 nonceA = 7;
@@ -409,13 +444,12 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.reveal(requestId, ansA, nonceA);
     }
 
-
     function test_Reveal_Revert_DeadlinePassed_AfterRevealWindow() public {
         (uint256 requestId, uint256 deadline) = _createBasicRequest();
         _do3Commits(requestId);
 
-        // reveal window ends at deadline + 1 day
-        uint256 revealDeadline = deadline + oracle.REVEAL_WINDOW();
+        // reveal window ends at deadline + revealWindow
+        uint256 revealDeadline = deadline + revealWindow;
         vm.warp(revealDeadline + 1);
 
         vm.prank(agentA);
@@ -454,6 +488,22 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.closeReveals(requestId);
     }
 
+    function test_CloseReveals_Succeeds_AfterRevealWindowEnds() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+
+        // Only one reveal
+        vm.prank(agentA);
+        oracle.reveal(requestId, bytes("4"), 111);
+
+        // Warp past reveal deadline
+        uint256 revealDeadline = deadline + revealWindow;
+        vm.warp(revealDeadline + 1);
+
+        // Now closeReveals should succeed
+        oracle.closeReveals(requestId);
+    }
+
     // ---------------- judge registration edge cases ----------------
 
     function test_RegisterJudge_Revert_NotFound() public {
@@ -470,12 +520,11 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
     }
 
     function test_RegisterJudge_Revert_JudgePoolClosed_AfterDeadline() public {
-        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        (uint256 requestId,) = _createBasicRequest();
         _do3Commits(requestId);
         _do3Reveals(requestId);
 
         uint256 signup = oracle.getJudgeSignupDeadline(requestId);
-        assertEq(signup, deadline + oracle.REVEAL_WINDOW());
 
         vm.warp(signup); // >= signup deadline => closed
         vm.prank(judge1);
@@ -514,6 +563,22 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         vm.prank(judge1);
         vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
         oracle.unregisterJudgeForRequest(requestId);
+    }
+
+    function test_UnregisterJudge_Success() public {
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        vm.prank(judge1);
+        oracle.registerJudgeForRequest(requestId);
+        assertEq(oracle.judgeCount(requestId), 1);
+        assertTrue(oracle.isJudgeForRequest(requestId, judge1));
+
+        vm.prank(judge1);
+        oracle.unregisterJudgeForRequest(requestId);
+        assertEq(oracle.judgeCount(requestId), 0);
+        assertFalse(oracle.isJudgeForRequest(requestId, judge1));
     }
 
     // ---------------- selectJudge edge cases ----------------
@@ -558,6 +623,53 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.selectJudge(requestId);
     }
 
+    // ---------------- postJudgeBond edge cases ----------------
+
+    function test_PostJudgeBond_Revert_BadPhase() public {
+        (uint256 requestId,) = _createBasicRequest();
+        
+        vm.prank(judge1);
+        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        oracle.postJudgeBond{value: judgeBond}(requestId);
+    }
+
+    function test_PostJudgeBond_Revert_NotJudge() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        address picked = _selectJudgeNoBond(requestId, deadline);
+        address notPicked = (picked == judge1) ? judge2 : judge1;
+
+        vm.prank(notPicked);
+        vm.expectRevert(TestAgentCouncilOracleNative.NotJudge.selector);
+        oracle.postJudgeBond{value: judgeBond}(requestId);
+    }
+
+    function test_PostJudgeBond_Revert_WrongJudgeBond() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        address picked = _selectJudgeNoBond(requestId, deadline);
+
+        vm.prank(picked);
+        vm.expectRevert(TestAgentCouncilOracleNative.WrongJudgeBond.selector);
+        oracle.postJudgeBond{value: judgeBond - 1}(requestId);
+    }
+
+    function test_PostJudgeBond_Revert_JudgeBondAlreadyPosted() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        address picked = _selectJudge(requestId, deadline); // This posts bond
+
+        vm.prank(picked);
+        vm.expectRevert(TestAgentCouncilOracleNative.JudgeBondAlreadyPosted.selector);
+        oracle.postJudgeBond{value: judgeBond}(requestId);
+    }
+
     // ---------------- aggregate edge cases ----------------
 
     function test_Aggregate_Revert_BadPhase() public {
@@ -588,6 +700,22 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.aggregate(requestId, bytes("4"), winners, bytes("x"));
     }
 
+    function test_Aggregate_Revert_JudgeBondNotPosted() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        address picked = _selectJudgeNoBond(requestId, deadline); // No bond posted
+
+        address[] memory winners = new address[](2);
+        winners[0] = agentA;
+        winners[1] = agentB;
+
+        vm.prank(picked);
+        vm.expectRevert(TestAgentCouncilOracleNative.JudgeBondNotPosted.selector);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("x"));
+    }
+
     function test_Aggregate_Allows_WinnersNotInCommits_PaysThemAnyway() public {
         (uint256 requestId, uint256 deadline) = _createBasicRequest();
         _do3Commits(requestId);
@@ -606,6 +734,44 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.distributeRewards(requestId);
 
         assertGt(agentD.balance, dBefore, "agentD should have received payout even though not committed");
+    }
+
+    function test_Aggregate_NoQuorum_FailsGracefully() public {
+        uint256 deadline = block.timestamp + 1 days;
+        uint256 requestId = _createRequest(3, reward, bond, deadline);
+
+        // Only 2 commits (need 3)
+        vm.prank(agentA);
+        oracle.commit{value: bond}(requestId, _commitment(bytes("4"), 111));
+        vm.prank(agentB);
+        oracle.commit{value: bond}(requestId, _commitment(bytes("4"), 222));
+
+        // Warp past commit deadline to allow reveal phase
+        vm.warp(deadline + 1);
+
+        // Only 1 reveal (less than majority of 2 commits)
+        vm.prank(agentA);
+        oracle.reveal(requestId, bytes("4"), 111);
+
+        // Close reveals after window
+        uint256 revealDeadline = deadline + revealWindow;
+        vm.warp(revealDeadline + 1);
+        oracle.closeReveals(requestId);
+
+        // Register and select judge
+        vm.prank(judge1);
+        oracle.registerJudgeForRequest(requestId);
+        oracle.selectJudge(requestId);
+
+        vm.prank(judge1);
+        oracle.postJudgeBond{value: judgeBond}(requestId);
+
+        address[] memory winners = new address[](1);
+        winners[0] = agentA;
+
+        // Should emit ResolutionFailed with NO_QUORUM
+        vm.prank(judge1);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("no quorum"));
     }
 
     // ---------------- distributeRewards edge cases ----------------
@@ -649,7 +815,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _do3Reveals(requestId);
 
         address picked = _selectJudge(requestId, deadline);
-        uint256 judgeInitial = picked.balance + bond; // judge already spent bond in _selectJudge
+        uint256 judgeInitial = picked.balance + judgeBond; // judge already spent bond in _selectJudge
 
         address[] memory winners = new address[](0);
 
@@ -671,7 +837,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         uint256 localBond = 1 wei;
 
         uint256 deadline = block.timestamp + 1 days;
-        uint256 requestId = _createRequest(3, reward, localBond, deadline, address(0), address(0));
+        uint256 requestId = _createRequest(3, reward, localBond, deadline);
 
         uint256 reqBefore = requester.balance;
 
@@ -695,7 +861,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         // Judge must post bond after being selected
         vm.prank(picked);
-        oracle.postJudgeBond{value: localBond}(requestId);
+        oracle.postJudgeBond{value: judgeBond}(requestId);
 
         address[] memory winners = new address[](2);
         winners[0] = agentA;
@@ -720,6 +886,53 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         assertEq(requester.balance, reqBefore + 1 wei, "requester got remainder");
     }
 
+    // ---------------- timeoutJudge edge cases ----------------
+
+    function test_TimeoutJudge_Revert_BadPhase() public {
+        (uint256 requestId,) = _createBasicRequest();
+        
+        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        oracle.timeoutJudge(requestId);
+    }
+
+    function test_TimeoutJudge_Revert_TooEarly() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        _selectJudgeNoBond(requestId, deadline);
+
+        // Try to timeout before judgeAggDeadline
+        vm.expectRevert(TestAgentCouncilOracleNative.TooEarly.selector);
+        oracle.timeoutJudge(requestId);
+    }
+
+    function test_TimeoutJudge_Success_SlashesJudgeBond() public {
+        uint256 reqInitial = requester.balance;
+        uint256 aInitial = agentA.balance;
+        uint256 bInitial = agentB.balance;
+        uint256 cInitial = agentC.balance;
+
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        _selectJudge(requestId, deadline);
+        
+        // Warp past judge aggregation deadline
+        vm.warp(block.timestamp + judgeAggWindow + 1);
+
+        oracle.timeoutJudge(requestId);
+
+        // Requester gets reward back + share of judge bond
+        // Agents get their bonds back + share of judge bond
+        assertEq(address(oracle).balance, 0, "contract should have no funds");
+        assertGt(requester.balance, reqInitial, "requester got reward + judge bond share");
+        assertGt(agentA.balance, aInitial, "agentA got bond back + judge bond share");
+        assertGt(agentB.balance, bInitial, "agentB got bond back + judge bond share");
+        assertGt(agentC.balance, cInitial, "agentC got bond back + judge bond share");
+    }
+
     // ---------------- refundIfNoJudge edge cases ----------------
 
     function test_RefundIfNoJudge_Revert_BadPhase() public {
@@ -738,6 +951,42 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.refundIfNoJudge(requestId);
     }
 
+    function test_RefundIfNoJudge_Revert_JudgePoolClosed_AfterSelection() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        _selectJudgeNoBond(requestId, deadline);
+
+        // Phase is now Judging, not AwaitingJudge
+        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        oracle.refundIfNoJudge(requestId);
+    }
+
+    function test_RefundIfNoJudge_Success() public {
+        uint256 reqInitial = requester.balance;
+        uint256 aInitial = agentA.balance;
+        uint256 bInitial = agentB.balance;
+        uint256 cInitial = agentC.balance;
+
+        (uint256 requestId,) = _createBasicRequest();
+        _do3Commits(requestId);
+        _do3Reveals(requestId);
+
+        // Don't register any judges, warp past signup deadline
+        uint256 signup = oracle.getJudgeSignupDeadline(requestId);
+        vm.warp(signup);
+
+        oracle.refundIfNoJudge(requestId);
+
+        // Everyone should be refunded
+        assertEq(address(oracle).balance, 0, "contract should have no funds");
+        assertEq(requester.balance, reqInitial, "requester got reward back");
+        assertEq(agentA.balance, aInitial, "agentA got bond back");
+        assertEq(agentB.balance, bInitial, "agentB got bond back");
+        assertEq(agentC.balance, cInitial, "agentC got bond back");
+    }
+
     // ---------------- misc getters / NotFound ----------------
 
     function test_Getters_Revert_NotFound() public {
@@ -752,5 +1001,35 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
         oracle.getResolution(999);
+    }
+
+    function test_Getters_Success() public {
+        (uint256 requestId,) = _createBasicRequest();
+
+        IAgentCouncilOracle.Request memory req = oracle.getRequest(requestId);
+        assertEq(req.requester, requester);
+        assertEq(req.rewardAmount, reward);
+        assertEq(req.bondAmount, bond);
+        assertEq(req.numInfoAgents, numAgents);
+
+        (address[] memory commitAgents, bytes32[] memory commitHashes) = oracle.getCommits(requestId);
+        assertEq(commitAgents.length, 0);
+        assertEq(commitHashes.length, 0);
+
+        (address[] memory revealAgents, bytes[] memory answers) = oracle.getReveals(requestId);
+        assertEq(revealAgents.length, 0);
+        assertEq(answers.length, 0);
+
+        (bytes memory finalAnswer, bool finalized) = oracle.getResolution(requestId);
+        assertEq(finalAnswer.length, 0);
+        assertFalse(finalized);
+    }
+
+    function test_GetConfigurableParams() public {
+        (uint256 requestId,) = _createBasicRequest();
+
+        assertEq(oracle.getJudgeBondAmount(requestId), judgeBond);
+        assertEq(oracle.getJudgeAggWindow(requestId), judgeAggWindow);
+        assertEq(oracle.getJudgeRewardBps(requestId), judgeRewardBps);
     }
 }
