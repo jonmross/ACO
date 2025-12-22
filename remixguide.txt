@@ -1,0 +1,67 @@
+Step by step to test run through contract -
+Make value drop down ether. 
+Value : 1 
+createRequest function Values : 
+query:
+ "How many inches in 12 ft?"
+numInfoAgents:
+ 2
+rewardAmount:
+ 1000000000000000000
+bondAmount:
+ 100000000000000000
+deadline:
+ 4102444800
+rewardToken:
+ 0x0000000000000000000000000000000000000000
+bondToken:
+ 0x0000000000000000000000000000000000000000
+specifications:
+ "Return integer inches only."
+requiredCapabilities:
+ [[],[]]
+Switch to Account 2, open COMMIT -
+Value : 100000000000000000 wei or 1 ether
+ requestId : 1, 
+commitment 0xe89275fb269a4dba34aa124ff9a4368b69270c6095d39bff08b9b87880a2f0ec
+Switch to Account 3, open commit
+Value : 1 ether
+RequestId : 1
+Commitment : 0x0407976d5e5db26ab7835d396acda7beff76a8f3bf344d1042439a156458fcc2
+Switch to account 2, Reveal Function : 
+Value : 0 
+requestId : 1 
+Answer : 0x313434
+Nonce : 111
+Switch to account 3 Reveal Function :
+Value : 0 
+requestId: 1
+answer: 0x313434
+nonce: 222
+Switch to account 4, Register Judge function
+requestId : 1 
+selectJudge function : 
+requestId : 1 
+postJudgeBond - 
+Value - 1 ether
+requestID - 1 
+GETCOMMITS function
+requestId: 1, Copy the returned agents array (it will show Account B and Account C addresses).
+Aggregate Function
+requestId: 1
+
+
+finalAnswer: 0x313434
+
+
+winners: paste the agents array you copied from getCommits(1)
+["0xAb8483F64d9C6d1EcF9b849Ae677dD3315835cb2","0x4B20993Bc481177ec7E8f571ceCaE8A9e22C02db"]
+Reasoning: 0x 
+11. Distribute rewards (any account)
+requestId: 1
+
+
+Do judges need to put a bond up before registering?
+
+Do we want get commits to give the nonce for the hash and bytes? 
+
