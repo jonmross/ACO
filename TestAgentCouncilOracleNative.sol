@@ -7,6 +7,23 @@ interface IAgentCouncilOracle {
         string[] domains;
     }
 
+    struct CreateRequestParams {
+        string query;
+        uint256 numInfoAgents;
+        uint256 rewardAmount;
+        uint256 bondAmount;
+        uint256 deadline;            // commit deadline
+        uint256 judgeSignupDeadline; // must be >= revealDeadline
+        uint256 revealWindow;        // duration after commit deadline for reveals
+        uint256 judgeBondAmount;     // bond amount required from judge
+        uint256 judgeAggWindow;      // time window for judge to aggregate after selection
+        uint16 judgeRewardBps;       // judge reward as basis points of rewardAmount (e.g., 1000 = 10%)
+        address rewardToken;
+        address bondToken;
+        string specifications;
+        AgentCapabilities requiredCapabilities;
+    }
+
     struct Request {
         address requester;
         uint256 rewardAmount;
@@ -35,17 +52,7 @@ interface IAgentCouncilOracle {
     event RewardsDistributed(uint256 indexed requestId, address[] winners, uint256[] amounts);
     event ResolutionFailed(uint256 indexed requestId, string reason);
 
-    function createRequest(
-        string calldata query,
-        uint256 numInfoAgents,
-        uint256 rewardAmount,
-        uint256 bondAmount,
-        uint256 deadline,
-        address rewardToken,
-        address bondToken,
-        string calldata specifications,
-        AgentCapabilities calldata requiredCapabilities
-    ) external payable returns (uint256 requestId);
+    function createRequest(CreateRequestParams calldata params) external payable returns (uint256 requestId);
 
     function commit(uint256 requestId, bytes32 commitment) external payable;
     function reveal(uint256 requestId, bytes calldata answer, uint256 nonce) external;
@@ -69,18 +76,10 @@ interface IAgentCouncilOracle {
 }
 
 contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
-    uint256 public constant REVEAL_WINDOW = 1 days;
-
     // -------------------------
-    // judge reward percent
+    // basis points denominator
     // -------------------------
     uint16 public constant BPS_DENOM = 10_000;
-    uint16 public constant JUDGE_REWARD_BPS = 1_000; // 10% of rewardAmount
-
-    // -------------------------
-    // judge must aggregate within window (selection time + 1 day)
-    // -------------------------
-    uint256 public constant JUDGE_AGG_WINDOW = 1 days;
 
     enum Phase {
         None,
@@ -103,6 +102,11 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
 
         uint256 deadline;            // commit deadline (absolute timestamp)
         uint256 judgeSignupDeadline; // judge signup cutoff (absolute timestamp)
+
+        // Configurable parameters
+        uint256 judgeBondAmount;     // bond amount required from judge
+        uint256 judgeAggWindow;      // time window for judge to aggregate after selection
+        uint16 judgeRewardBps;       // judge reward as basis points of rewardAmount
 
         string query;
         string specifications;
@@ -133,7 +137,7 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         mapping(address => uint256) bondHeld;
         uint256 revealDeadline;
 
-        // judge bond state (posted AFTER selection; amount = agent bondAmount)
+        // judge bond state (posted AFTER selection)
         bool judgeBondPosted;
         uint256 judgeBondHeld;
         uint256 judgeAggDeadline;
@@ -155,19 +159,6 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         mapping(address => uint256) indexPlusOne; // 1-based index for swap-remove
     }
     mapping(uint256 => JudgePool) private _judgePool;
-
-    struct CreateRequestV2Params {
-        string query;
-        uint256 numInfoAgents;
-        uint256 rewardAmount;
-        uint256 bondAmount;
-        uint256 deadline;            // commit deadline
-        uint256 judgeSignupDeadline; // must be >= revealDeadline
-        address rewardToken;
-        address bondToken;
-        string specifications;
-        AgentCapabilities requiredCapabilities;
-    }
 
     // ---- Errors ----
     error NotFound();
@@ -191,6 +182,8 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
     error BadJudgeDeadline();
     error RevealsStillOpen();
     error TooEarly();
+    error InvalidWindow();
+    error InvalidBps();
 
     // no revert strings on transfers
     error RewardRefundFail();
@@ -282,6 +275,26 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         return s.req.judgeSignupDeadline;
     }
 
+    function getJudgeBondAmount(uint256 requestId) external view returns (uint256) {
+        RequestState storage s = _get(requestId);
+        return s.req.judgeBondAmount;
+    }
+
+    function getJudgeAggWindow(uint256 requestId) external view returns (uint256) {
+        RequestState storage s = _get(requestId);
+        return s.req.judgeAggWindow;
+    }
+
+    function getJudgeRewardBps(uint256 requestId) external view returns (uint16) {
+        RequestState storage s = _get(requestId);
+        return s.req.judgeRewardBps;
+    }
+
+    function getRevealDeadline(uint256 requestId) external view returns (uint256) {
+        RequestState storage s = _get(requestId);
+        return s.revealDeadline;
+    }
+
     function _pickJudge(uint256 requestId, RequestState storage s) internal view returns (address) {
         JudgePool storage p = _judgePool[requestId];
         uint256 n = p.judges.length;
@@ -302,60 +315,21 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         return p.judges[uint256(h) % n];
     }
 
-    // Default: judgeSignupDeadline = revealDeadline (deadline + REVEAL_WINDOW)
-    function createRequest(
-        string calldata query,
-        uint256 numInfoAgents,
-        uint256 rewardAmount,
-        uint256 bondAmount,
-        uint256 deadline,
-        address rewardToken,
-        address bondToken,
-        string calldata specifications,
-        AgentCapabilities calldata requiredCapabilities
-    ) external payable override returns (uint256 requestId) {
-        if (rewardToken != address(0) || bondToken != address(0)) revert TokenNotSupported();
-        if (numInfoAgents == 0) revert TooManyAgents();
-        if (deadline <= block.timestamp) revert DeadlinePassed();
-        if (msg.value != rewardAmount) revert NotEnoughValue();
-
-        requestId = _nextRequestId++;
-        RequestState storage s = _st[requestId];
-
-        s.phase = Phase.Commit;
-        s.revealDeadline = deadline + REVEAL_WINDOW;
-
-        StoredRequest storage r = s.req;
-        r.requester = msg.sender;
-        r.rewardAmount = rewardAmount;
-        r.rewardToken = address(0);
-        r.bondAmount = bondAmount;
-        r.bondToken = address(0);
-        r.numInfoAgents = numInfoAgents;
-
-        r.deadline = deadline;
-        r.judgeSignupDeadline = s.revealDeadline;
-
-        r.query = query;
-        r.specifications = specifications;
-
-        _requiredCapsEncoded[requestId] = abi.encode(requiredCapabilities);
-
-        _emitRequestCreated(requestId);
-    }
-
-    // judgeSignupDeadline must be >= revealDeadline
-    function createRequestV2(CreateRequestV2Params calldata p)
+    function createRequest(CreateRequestParams calldata p)
         external
         payable
+        override
         returns (uint256 requestId)
     {
         if (p.rewardToken != address(0) || p.bondToken != address(0)) revert TokenNotSupported();
         if (p.numInfoAgents == 0) revert TooManyAgents();
         if (p.deadline <= block.timestamp) revert DeadlinePassed();
         if (msg.value != p.rewardAmount) revert NotEnoughValue();
+        if (p.revealWindow == 0) revert InvalidWindow();
+        if (p.judgeAggWindow == 0) revert InvalidWindow();
+        if (p.judgeRewardBps > BPS_DENOM) revert InvalidBps();
 
-        uint256 revealDeadline = p.deadline + REVEAL_WINDOW;
+        uint256 revealDeadline = p.deadline + p.revealWindow;
         if (p.judgeSignupDeadline <= block.timestamp) revert BadJudgeDeadline();
         if (p.judgeSignupDeadline < revealDeadline) revert BadJudgeDeadline();
 
@@ -375,6 +349,10 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
 
         r.deadline = p.deadline;
         r.judgeSignupDeadline = p.judgeSignupDeadline;
+
+        r.judgeBondAmount = p.judgeBondAmount;
+        r.judgeAggWindow = p.judgeAggWindow;
+        r.judgeRewardBps = p.judgeRewardBps;
 
         r.query = p.query;
         r.specifications = p.specifications;
@@ -459,28 +437,28 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
 
         s.judge = j;
 
-        // judge must post bond AFTER being chosen; aggregate deadline starts now
+        // judge must post bond AFTER being chosen; aggregate deadline uses configured window
         s.judgeBondPosted = false;
         s.judgeBondHeld = 0;
-        s.judgeAggDeadline = block.timestamp + JUDGE_AGG_WINDOW;
+        s.judgeAggDeadline = block.timestamp + s.req.judgeAggWindow;
 
         s.phase = Phase.Judging;
         emit JudgeSelected(requestId, j);
     }
 
-    // Judge posts bond AFTER being chosen. Bond = same as agent bondAmount.
+    // Judge posts bond AFTER being chosen. Bond = configured judgeBondAmount.
     function postJudgeBond(uint256 requestId) external payable {
         RequestState storage s = _get(requestId);
         if (s.phase != Phase.Judging) revert BadPhase();
         if (msg.sender != s.judge) revert NotJudge();
         if (s.judgeBondPosted) revert JudgeBondAlreadyPosted();
-        if (msg.value != s.req.bondAmount) revert WrongJudgeBond();
+        if (msg.value != s.req.judgeBondAmount) revert WrongJudgeBond();
 
         s.judgeBondPosted = true;
         s.judgeBondHeld = msg.value;
     }
 
-    // If judge doesn't aggregate within 1 day, refund reward+bonds and slash judge bond to requester+revealers.
+    // If judge doesn't aggregate within window, refund reward+bonds and slash judge bond to requester+revealers.
     function timeoutJudge(uint256 requestId) external {
         RequestState storage s = _get(requestId);
         if (s.phase != Phase.Judging) revert BadPhase();
@@ -658,7 +636,7 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         }
 
         uint256 reward = s.req.rewardAmount;
-        uint256 judgeCut = (reward * uint256(JUDGE_REWARD_BPS)) / uint256(BPS_DENOM);
+        uint256 judgeCut = (reward * uint256(s.req.judgeRewardBps)) / uint256(BPS_DENOM);
 
         if (judgeCut > 0) {
             (bool ok,) = s.judge.call{value: judgeCut}("");
