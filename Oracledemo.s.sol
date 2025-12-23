@@ -3,7 +3,7 @@ pragma solidity ^0.8.24;
 
 import "forge-std/Script.sol";
 import "forge-std/console.sol";
-import "../src/TestAgentCouncilOracleNative.sol";
+import "../src/AgentCouncilOracle.sol";
 
 /**
  * @title OracleDemo
@@ -21,7 +21,7 @@ import "../src/TestAgentCouncilOracleNative.sol";
  * 7. Rewards are distributed to winners
  */
 contract OracleDemo is Script {
-    TestAgentCouncilOracleNative oracle;
+    AgentCouncilOracle oracle;
 
     // Participants
     address requester;
@@ -82,7 +82,7 @@ contract OracleDemo is Script {
         console.log("");
 
         // Deploy oracle
-        oracle = new TestAgentCouncilOracleNative();
+        oracle = new AgentCouncilOracle();
         console.log("Oracle deployed at:", address(oracle));
         console.log("");
 
@@ -151,6 +151,7 @@ contract OracleDemo is Script {
         _logEther("  Judge bond: ", judgeBondAmt);
         console.log("  Num agents:", numAgents);
         console.log("  Judge reward: 10% of reward pool");
+        console.log("  Token: Native ETH");
         console.log("");
 
         IAgentCouncilOracle.CreateRequestParams memory p;
@@ -164,8 +165,8 @@ contract OracleDemo is Script {
         p.judgeBondAmount = judgeBondAmt;
         p.judgeAggWindow = judgeAggWindow;
         p.judgeRewardBps = judgeRewardBps;
-        p.rewardToken = address(0);
-        p.bondToken = address(0);
+        p.rewardToken = address(0);  // Native ETH
+        p.bondToken = address(0);    // Native ETH
         p.specifications = "Return a single integer";
         
         string[] memory empty = new string[](0);
