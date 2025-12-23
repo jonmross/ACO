@@ -1,6 +1,12 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.24;
 
+interface IERC20 {
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+    function transfer(address to, uint256 amount) external returns (bool);
+    function balanceOf(address account) external view returns (uint256);
+}
+
 interface IAgentCouncilOracle {
     struct AgentCapabilities {
         string[] capabilities;
@@ -18,8 +24,8 @@ interface IAgentCouncilOracle {
         uint256 judgeBondAmount;     // bond amount required from judge
         uint256 judgeAggWindow;      // time window for judge to aggregate after selection
         uint16 judgeRewardBps;       // judge reward as basis points of rewardAmount (e.g., 1000 = 10%)
-        address rewardToken;
-        address bondToken;
+        address rewardToken;         // address(0) for native ETH, or ERC20 token address
+        address bondToken;           // address(0) for native ETH, or ERC20 token address
         string specifications;
         AgentCapabilities requiredCapabilities;
     }
@@ -75,7 +81,7 @@ interface IAgentCouncilOracle {
     function getReveals(uint256 requestId) external view returns (address[] memory agents, bytes[] memory answers);
 }
 
-contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
+contract AgentCouncilOracle is IAgentCouncilOracle {
     // -------------------------
     // basis points denominator
     // -------------------------
@@ -95,9 +101,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
     struct StoredRequest {
         address requester;
         uint256 rewardAmount;
-        address rewardToken; // must be address(0)
+        address rewardToken;         // address(0) = native ETH
         uint256 bondAmount;
-        address bondToken;   // must be address(0)
+        address bondToken;           // address(0) = native ETH
         uint256 numInfoAgents;
 
         uint256 deadline;            // commit deadline (absolute timestamp)
@@ -173,7 +179,6 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
     error NotJudge();
     error AlreadyFinalized();
     error AlreadyDistributed();
-    error TokenNotSupported();
     error NoJudgesRegistered();
     error JudgeCannotCommit();
 
@@ -185,18 +190,47 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
     error InvalidWindow();
     error InvalidBps();
 
-    // no revert strings on transfers
-    error RewardRefundFail();
-    error BondRefundFail();
-    error RewardPayFail();
-    error RemainderFail();
+    // Transfer errors
+    error RewardTransferFailed();
+    error BondTransferFailed();
+    error JudgeBondTransferFailed();
+    error TokenMismatch();
 
     // judge bond errors
     error JudgeBondNotPosted();
     error WrongJudgeBond();
     error JudgeBondAlreadyPosted();
-    error JudgeBondRefundFail();
-    error JudgeBondPayFail();
+
+    // ---- Internal transfer helpers ----
+
+    /// @dev Transfer tokens or ETH to this contract (pull)
+    function _pullTokens(address token, address from, uint256 amount) internal {
+        if (amount == 0) return;
+        
+        if (token == address(0)) {
+            // Native ETH - must be sent with msg.value
+            if (msg.value != amount) revert NotEnoughValue();
+        } else {
+            // ERC20 token
+            if (msg.value != 0) revert TokenMismatch(); // Don't send ETH when using tokens
+            bool success = IERC20(token).transferFrom(from, address(this), amount);
+            if (!success) revert BondTransferFailed();
+        }
+    }
+
+    /// @dev Transfer tokens or ETH from this contract (push)
+    function _pushTokens(address token, address to, uint256 amount) internal returns (bool) {
+        if (amount == 0) return true;
+        
+        if (token == address(0)) {
+            // Native ETH
+            (bool ok,) = to.call{value: amount}("");
+            return ok;
+        } else {
+            // ERC20 token
+            return IERC20(token).transfer(to, amount);
+        }
+    }
 
     function _get(uint256 requestId) internal view returns (RequestState storage s) {
         s = _st[requestId];
@@ -321,10 +355,8 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         override
         returns (uint256 requestId)
     {
-        if (p.rewardToken != address(0) || p.bondToken != address(0)) revert TokenNotSupported();
         if (p.numInfoAgents == 0) revert TooManyAgents();
         if (p.deadline <= block.timestamp) revert DeadlinePassed();
-        if (msg.value != p.rewardAmount) revert NotEnoughValue();
         if (p.revealWindow == 0) revert InvalidWindow();
         if (p.judgeAggWindow == 0) revert InvalidWindow();
         if (p.judgeRewardBps > BPS_DENOM) revert InvalidBps();
@@ -332,6 +364,15 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         uint256 revealDeadline = p.deadline + p.revealWindow;
         if (p.judgeSignupDeadline <= block.timestamp) revert BadJudgeDeadline();
         if (p.judgeSignupDeadline < revealDeadline) revert BadJudgeDeadline();
+
+        // Pull reward tokens/ETH from requester
+        if (p.rewardToken == address(0)) {
+            if (msg.value != p.rewardAmount) revert NotEnoughValue();
+        } else {
+            if (msg.value != 0) revert TokenMismatch();
+            bool success = IERC20(p.rewardToken).transferFrom(msg.sender, address(this), p.rewardAmount);
+            if (!success) revert RewardTransferFailed();
+        }
 
         requestId = _nextRequestId++;
         RequestState storage s = _st[requestId];
@@ -342,9 +383,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         StoredRequest storage r = s.req;
         r.requester = msg.sender;
         r.rewardAmount = p.rewardAmount;
-        r.rewardToken = address(0);
+        r.rewardToken = p.rewardToken;
         r.bondAmount = p.bondAmount;
-        r.bondToken = address(0);
+        r.bondToken = p.bondToken;
         r.numInfoAgents = p.numInfoAgents;
 
         r.deadline = p.deadline;
@@ -370,13 +411,15 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         if (block.timestamp >= s.req.deadline) revert DeadlinePassed();
         if (s.commitAgents.length >= s.req.numInfoAgents) revert TooManyAgents();
         if (s.hasCommitted[msg.sender]) revert AlreadyCommitted();
-        if (msg.value != s.req.bondAmount) revert NotEnoughValue();
+
+        // Pull bond tokens/ETH
+        _pullTokens(s.req.bondToken, msg.sender, s.req.bondAmount);
 
         s.hasCommitted[msg.sender] = true;
         s.commitmentOf[msg.sender] = commitment;
         s.commitAgents.push(msg.sender);
         s.commitHashes.push(commitment);
-        s.bondHeld[msg.sender] = msg.value;
+        s.bondHeld[msg.sender] = s.req.bondAmount;
 
         emit AgentCommitted(requestId, msg.sender, commitment);
 
@@ -446,16 +489,18 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         emit JudgeSelected(requestId, j);
     }
 
-    // Judge posts bond AFTER being chosen. Bond = configured judgeBondAmount.
+    // Judge posts bond AFTER being chosen. Uses bondToken (same as agent bonds).
     function postJudgeBond(uint256 requestId) external payable {
         RequestState storage s = _get(requestId);
         if (s.phase != Phase.Judging) revert BadPhase();
         if (msg.sender != s.judge) revert NotJudge();
         if (s.judgeBondPosted) revert JudgeBondAlreadyPosted();
-        if (msg.value != s.req.judgeBondAmount) revert WrongJudgeBond();
+
+        // Pull judge bond tokens/ETH
+        _pullTokens(s.req.bondToken, msg.sender, s.req.judgeBondAmount);
 
         s.judgeBondPosted = true;
-        s.judgeBondHeld = msg.value;
+        s.judgeBondHeld = s.req.judgeBondAmount;
     }
 
     // If judge doesn't aggregate within window, refund reward+bonds and slash judge bond to requester+revealers.
@@ -472,8 +517,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         uint256 reward = s.req.rewardAmount;
         s.req.rewardAmount = 0;
         if (reward > 0) {
-            (bool ok,) = s.req.requester.call{value: reward}("");
-            if (!ok) revert RewardRefundFail();
+            if (!_pushTokens(s.req.rewardToken, s.req.requester, reward)) {
+                revert RewardTransferFailed();
+            }
         }
 
         // refund all agent bonds
@@ -482,8 +528,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
             uint256 b = s.bondHeld[a];
             if (b == 0) continue;
             s.bondHeld[a] = 0;
-            (bool ok2,) = a.call{value: b}("");
-            if (!ok2) revert BondRefundFail();
+            if (!_pushTokens(s.req.bondToken, a, b)) {
+                revert BondTransferFailed();
+            }
         }
 
         // slash judge bond if posted: split among requester + revealAgents
@@ -497,12 +544,14 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
             uint256 per = jb / participants;
             uint256 rem = jb - (per * participants);
 
-            (bool okR,) = s.req.requester.call{value: per + rem}("");
-            if (!okR) revert JudgeBondPayFail();
+            if (!_pushTokens(s.req.bondToken, s.req.requester, per + rem)) {
+                revert JudgeBondTransferFailed();
+            }
 
             for (uint256 i = 0; i < n; i++) {
-                (bool okA,) = s.revealAgents[i].call{value: per}("");
-                if (!okA) revert JudgeBondPayFail();
+                if (!_pushTokens(s.req.bondToken, s.revealAgents[i], per)) {
+                    revert JudgeBondTransferFailed();
+                }
             }
         }
     }
@@ -522,8 +571,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
         s.req.rewardAmount = 0;
 
         if (reward > 0) {
-            (bool ok,) = s.req.requester.call{value: reward}("");
-            if (!ok) revert RewardRefundFail();
+            if (!_pushTokens(s.req.rewardToken, s.req.requester, reward)) {
+                revert RewardTransferFailed();
+            }
         }
 
         for (uint256 i = 0; i < s.commitAgents.length; i++) {
@@ -532,8 +582,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
             if (b == 0) continue;
 
             s.bondHeld[a] = 0;
-            (bool ok2,) = a.call{value: b}("");
-            if (!ok2) revert BondRefundFail();
+            if (!_pushTokens(s.req.bondToken, a, b)) {
+                revert BondTransferFailed();
+            }
         }
     }
 
@@ -593,8 +644,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
             uint256 rewardRefund = s.req.rewardAmount;
             s.req.rewardAmount = 0;
             if (rewardRefund > 0) {
-                (bool ok,) = s.req.requester.call{value: rewardRefund}("");
-                if (!ok) revert RewardRefundFail();
+                if (!_pushTokens(s.req.rewardToken, s.req.requester, rewardRefund)) {
+                    revert RewardTransferFailed();
+                }
             }
 
             // Refund all agent bonds
@@ -603,8 +655,9 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
                 uint256 b = s.bondHeld[a];
                 if (b == 0) continue;
                 s.bondHeld[a] = 0;
-                (bool ok2,) = a.call{value: b}("");
-                if (!ok2) revert BondRefundFail();
+                if (!_pushTokens(s.req.bondToken, a, b)) {
+                    revert BondTransferFailed();
+                }
             }
 
             // Refund judge bond to judge
@@ -612,13 +665,15 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
             if (judgeBondRefund > 0) {
                 s.judgeBondHeld = 0;
                 s.judgeBondPosted = false;
-                (bool ok3,) = s.judge.call{value: judgeBondRefund}("");
-                if (!ok3) revert JudgeBondRefundFail();
+                if (!_pushTokens(s.req.bondToken, s.judge, judgeBondRefund)) {
+                    revert JudgeBondTransferFailed();
+                }
             }
 
             return;
         }
 
+        // Process agent bonds: refund to winners, collect from losers
         uint256 loserBondSum;
         for (uint256 i = 0; i < s.commitAgents.length; i++) {
             address a = s.commitAgents[i];
@@ -628,48 +683,78 @@ contract TestAgentCouncilOracleNative is IAgentCouncilOracle {
             s.bondHeld[a] = 0;
 
             if (s.isWinner[a]) {
-                (bool ok,) = a.call{value: b}("");
-                if (!ok) revert BondRefundFail();
+                if (!_pushTokens(s.req.bondToken, a, b)) {
+                    revert BondTransferFailed();
+                }
             } else {
                 loserBondSum += b;
             }
         }
 
+        // Calculate judge cut from reward
         uint256 reward = s.req.rewardAmount;
         uint256 judgeCut = (reward * uint256(s.req.judgeRewardBps)) / uint256(BPS_DENOM);
 
+        // Pay judge cut (from reward token)
         if (judgeCut > 0) {
-            (bool ok,) = s.judge.call{value: judgeCut}("");
-            if (!ok) revert RewardPayFail();
+            if (!_pushTokens(s.req.rewardToken, s.judge, judgeCut)) {
+                revert RewardTransferFailed();
+            }
         }
 
-        // refund judge bond on success
+        // Refund judge bond on success (bond token)
         uint256 jb = s.judgeBondHeld;
         if (jb > 0) {
             s.judgeBondHeld = 0;
             s.judgeBondPosted = false;
-            (bool ok2,) = s.judge.call{value: jb}("");
-            if (!ok2) revert JudgeBondRefundFail();
+            if (!_pushTokens(s.req.bondToken, s.judge, jb)) {
+                revert JudgeBondTransferFailed();
+            }
         }
 
         uint256 remainingReward = reward - judgeCut;
 
-        uint256 pool = remainingReward + loserBondSum;
-        uint256 perWinner = pool / winnersLen;
-        uint256 remainder = pool - (perWinner * winnersLen);
+        // Winners split: remaining reward (in rewardToken) + loser bonds (in bondToken)
+        // Note: If rewardToken != bondToken, these are separate distributions
+        
+        uint256 perWinnerReward = remainingReward / winnersLen;
+        uint256 rewardRemainder = remainingReward - (perWinnerReward * winnersLen);
+        
+        uint256 perWinnerBond = loserBondSum / winnersLen;
+        uint256 bondRemainder = loserBondSum - (perWinnerBond * winnersLen);
 
         uint256[] memory amounts = new uint256[](winnersLen);
         for (uint256 i = 0; i < winnersLen; i++) {
             address w = s.winners[i];
-            amounts[i] = perWinner;
-
-            (bool ok3,) = w.call{value: perWinner}("");
-            if (!ok3) revert RewardPayFail();
+            
+            // Pay reward portion
+            if (perWinnerReward > 0) {
+                if (!_pushTokens(s.req.rewardToken, w, perWinnerReward)) {
+                    revert RewardTransferFailed();
+                }
+            }
+            
+            // Pay bond portion (slashed loser bonds)
+            if (perWinnerBond > 0) {
+                if (!_pushTokens(s.req.bondToken, w, perWinnerBond)) {
+                    revert BondTransferFailed();
+                }
+            }
+            
+            // Track total for event (note: may be in different tokens)
+            amounts[i] = perWinnerReward + perWinnerBond;
         }
 
-        if (remainder > 0) {
-            (bool ok4,) = s.req.requester.call{value: remainder}("");
-            if (!ok4) revert RemainderFail();
+        // Return remainders to requester
+        if (rewardRemainder > 0) {
+            if (!_pushTokens(s.req.rewardToken, s.req.requester, rewardRemainder)) {
+                revert RewardTransferFailed();
+            }
+        }
+        if (bondRemainder > 0) {
+            if (!_pushTokens(s.req.bondToken, s.req.requester, bondRemainder)) {
+                revert BondTransferFailed();
+            }
         }
 
         s.distributed = true;
