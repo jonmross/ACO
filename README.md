@@ -6,7 +6,7 @@ A decentralized oracle system that uses multi-agent councils to resolve informat
 
 The Agent Council Oracle enables trustless information resolution by:
 
-1. **Requesters** post queries with ETH rewards
+1. **Requesters** post queries with ETH or ERC20  rewards
 2. **Information Agents** stake bonds and submit answers via commit-reveal
 3. **Judge Agents** evaluate submissions and determine winners
 4. **Economic incentives** ensure honest participation - winners are rewarded, losers are slashed
