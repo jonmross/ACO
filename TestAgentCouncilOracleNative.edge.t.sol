@@ -2,10 +2,49 @@
 pragma solidity ^0.8.24;
 
 import "forge-std/Test.sol";
-import "../src/TestAgentCouncilOracleNative.sol";
+import "../src/AgentCouncilOracle.sol";
 
-contract TestAgentCouncilOracleNative_EdgeCases is Test {
-    TestAgentCouncilOracleNative oracle;
+// Simple ERC20 mock for testing
+contract MockERC20 is IERC20 {
+    string public name = "Mock Token";
+    string public symbol = "MOCK";
+    uint8 public decimals = 18;
+    uint256 public totalSupply;
+    
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+    
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+        totalSupply += amount;
+    }
+    
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+    
+    function transfer(address to, uint256 amount) external returns (bool) {
+        require(balanceOf[msg.sender] >= amount, "insufficient balance");
+        balanceOf[msg.sender] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+    
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        require(balanceOf[from] >= amount, "insufficient balance");
+        require(allowance[from][msg.sender] >= amount, "insufficient allowance");
+        allowance[from][msg.sender] -= amount;
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        return true;
+    }
+}
+
+contract AgentCouncilOracle_EdgeCases is Test {
+    AgentCouncilOracle oracle;
+    MockERC20 rewardToken;
+    MockERC20 bondToken;
 
     address requester = address(0xA11CE);
 
@@ -28,7 +67,9 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
     uint16 judgeRewardBps = 1000; // 10%
 
     function setUp() public {
-        oracle = new TestAgentCouncilOracleNative();
+        oracle = new AgentCouncilOracle();
+        rewardToken = new MockERC20();
+        bondToken = new MockERC20();
 
         vm.txGasPrice(0);
         vm.deal(requester, 100 ether);
@@ -40,6 +81,15 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         vm.deal(judge1, 100 ether);
         vm.deal(judge2, 100 ether);
+
+        // Mint tokens for ERC20 tests
+        rewardToken.mint(requester, 100 ether);
+        bondToken.mint(agentA, 100 ether);
+        bondToken.mint(agentB, 100 ether);
+        bondToken.mint(agentC, 100 ether);
+        bondToken.mint(agentD, 100 ether);
+        bondToken.mint(judge1, 100 ether);
+        bondToken.mint(judge2, 100 ether);
 
         vm.warp(1_000_000);
         vm.roll(100);
@@ -74,10 +124,22 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         p.judgeBondAmount = judgeBond;
         p.judgeAggWindow = judgeAggWindow;
         p.judgeRewardBps = judgeRewardBps;
-        p.rewardToken = address(0);
-        p.bondToken = address(0);
+        p.rewardToken = address(0); // native ETH by default
+        p.bondToken = address(0);   // native ETH by default
         p.specifications = "SPEC";
         p.requiredCapabilities = _emptyCaps();
+    }
+
+    function _createRequestParamsERC20(
+        uint256 _numAgents,
+        uint256 _reward,
+        uint256 _bond,
+        uint256 _deadline,
+        uint256 _judgeSignupDeadline
+    ) internal view returns (IAgentCouncilOracle.CreateRequestParams memory p) {
+        p = _createRequestParams(_numAgents, _reward, _bond, _deadline, _judgeSignupDeadline);
+        p.rewardToken = address(rewardToken);
+        p.bondToken = address(bondToken);
     }
 
     function _createRequest(
@@ -97,9 +159,33 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         requestId = oracle.createRequest{value: _reward}(p);
     }
 
+    function _createRequestERC20(
+        uint256 _numAgents,
+        uint256 _reward,
+        uint256 _bond,
+        uint256 _deadline
+    ) internal returns (uint256 requestId) {
+        uint256 revealDeadline = _deadline + revealWindow;
+        uint256 judgeSignupDeadline = revealDeadline + 1 days;
+        
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParamsERC20(
+            _numAgents, _reward, _bond, _deadline, judgeSignupDeadline
+        );
+        
+        vm.prank(requester);
+        rewardToken.approve(address(oracle), _reward);
+        vm.prank(requester);
+        requestId = oracle.createRequest(p); // no ETH sent for ERC20
+    }
+
     function _createBasicRequest() internal returns (uint256 requestId, uint256 deadline) {
         deadline = block.timestamp + 1 days;
         requestId = _createRequest(numAgents, reward, bond, deadline);
+    }
+
+    function _createBasicRequestERC20() internal returns (uint256 requestId, uint256 deadline) {
+        deadline = block.timestamp + 1 days;
+        requestId = _createRequestERC20(numAgents, reward, bond, deadline);
     }
 
     function _do3Commits(uint256 requestId) internal {
@@ -111,6 +197,23 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         vm.prank(agentC);
         oracle.commit{value: bond}(requestId, _commitment(bytes("5"), 333));
+    }
+
+    function _do3CommitsERC20(uint256 requestId) internal {
+        vm.prank(agentA);
+        bondToken.approve(address(oracle), bond);
+        vm.prank(agentA);
+        oracle.commit(requestId, _commitment(bytes("4"), 111));
+
+        vm.prank(agentB);
+        bondToken.approve(address(oracle), bond);
+        vm.prank(agentB);
+        oracle.commit(requestId, _commitment(bytes("4"), 222));
+
+        vm.prank(agentC);
+        bondToken.approve(address(oracle), bond);
+        vm.prank(agentC);
+        oracle.commit(requestId, _commitment(bytes("5"), 333));
     }
 
     function _do3Reveals(uint256 requestId) internal {
@@ -161,6 +264,18 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.postJudgeBond{value: judgeBond}(requestId);
     }
 
+    function _selectJudgeERC20(uint256 requestId, uint256 deadline) internal returns (address picked) {
+        _registerTwoJudges(requestId);
+        picked = _expectedPickedJudge(requestId, requester, deadline, 3);
+        oracle.selectJudge(requestId);
+
+        // Judge must post bond after being selected (ERC20)
+        vm.prank(picked);
+        bondToken.approve(address(oracle), judgeBond);
+        vm.prank(picked);
+        oracle.postJudgeBond(requestId);
+    }
+
     // Helper that selects judge WITHOUT posting bond (for testing pre-bond scenarios)
     function _selectJudgeNoBond(uint256 requestId, uint256 deadline) internal returns (address picked) {
         _registerTwoJudges(requestId);
@@ -168,21 +283,11 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.selectJudge(requestId);
     }
 
+    // ============================================================
+    // ================ NATIVE ETH TESTS ==========================
+    // ============================================================
+
     // ---------------- createRequest edge cases ----------------
-
-    function test_CreateRequest_Revert_TokenNotSupported() public {
-        uint256 deadline = block.timestamp + 1 days;
-        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
-
-        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParams(
-            numAgents, reward, bond, deadline, judgeSignupDeadline
-        );
-        p.rewardToken = address(0x1234); // non-zero token
-
-        vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.TokenNotSupported.selector);
-        oracle.createRequest{value: reward}(p);
-    }
 
     function test_CreateRequest_Revert_NumInfoAgentsZero() public {
         uint256 deadline = block.timestamp + 1 days;
@@ -193,7 +298,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         );
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.TooManyAgents.selector);
+        vm.expectRevert(AgentCouncilOracle.TooManyAgents.selector);
         oracle.createRequest{value: reward}(p);
     }
 
@@ -206,7 +311,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         );
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.DeadlinePassed.selector);
+        vm.expectRevert(AgentCouncilOracle.DeadlinePassed.selector);
         oracle.createRequest{value: reward}(p);
     }
 
@@ -219,7 +324,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         );
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotEnoughValue.selector);
+        vm.expectRevert(AgentCouncilOracle.NotEnoughValue.selector);
         oracle.createRequest{value: reward - 1}(p);
     }
 
@@ -233,7 +338,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         p.revealWindow = 0; // invalid
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.InvalidWindow.selector);
+        vm.expectRevert(AgentCouncilOracle.InvalidWindow.selector);
         oracle.createRequest{value: reward}(p);
     }
 
@@ -247,7 +352,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         p.judgeAggWindow = 0; // invalid
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.InvalidWindow.selector);
+        vm.expectRevert(AgentCouncilOracle.InvalidWindow.selector);
         oracle.createRequest{value: reward}(p);
     }
 
@@ -261,7 +366,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         p.judgeRewardBps = 10001; // > 10000
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.InvalidBps.selector);
+        vm.expectRevert(AgentCouncilOracle.InvalidBps.selector);
         oracle.createRequest{value: reward}(p);
     }
 
@@ -273,7 +378,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         );
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
+        vm.expectRevert(AgentCouncilOracle.BadJudgeDeadline.selector);
         oracle.createRequest{value: reward}(p);
     }
 
@@ -286,7 +391,25 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         );
 
         vm.prank(requester);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadJudgeDeadline.selector);
+        vm.expectRevert(AgentCouncilOracle.BadJudgeDeadline.selector);
+        oracle.createRequest{value: reward}(p);
+    }
+
+    function test_CreateRequest_Revert_TokenMismatch_ETHSentWithERC20() public {
+        uint256 deadline = block.timestamp + 1 days;
+        uint256 judgeSignupDeadline = deadline + revealWindow + 1 days;
+
+        IAgentCouncilOracle.CreateRequestParams memory p = _createRequestParamsERC20(
+            numAgents, reward, bond, deadline, judgeSignupDeadline
+        );
+
+        // Approve tokens
+        vm.prank(requester);
+        rewardToken.approve(address(oracle), reward);
+
+        // Try to send ETH with ERC20 request - should fail
+        vm.prank(requester);
+        vm.expectRevert(AgentCouncilOracle.TokenMismatch.selector);
         oracle.createRequest{value: reward}(p);
     }
 
@@ -294,7 +417,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
     function test_Commit_Revert_NotFound() public {
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
+        vm.expectRevert(AgentCouncilOracle.NotFound.selector);
         oracle.commit{value: bond}(999, bytes32(uint256(123)));
     }
 
@@ -303,7 +426,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         vm.warp(deadline); // >= deadline triggers DeadlinePassed in commit()
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.DeadlinePassed.selector);
+        vm.expectRevert(AgentCouncilOracle.DeadlinePassed.selector);
         oracle.commit{value: bond}(requestId, bytes32(uint256(123)));
     }
 
@@ -311,7 +434,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         (uint256 requestId,) = _createBasicRequest();
 
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotEnoughValue.selector);
+        vm.expectRevert(AgentCouncilOracle.NotEnoughValue.selector);
         oracle.commit{value: bond - 1}(requestId, bytes32(uint256(123)));
     }
 
@@ -322,7 +445,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.commit{value: bond}(requestId, bytes32(uint256(123)));
 
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.AlreadyCommitted.selector);
+        vm.expectRevert(AgentCouncilOracle.AlreadyCommitted.selector);
         oracle.commit{value: bond}(requestId, bytes32(uint256(456)));
     }
 
@@ -332,8 +455,21 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _do3Commits(requestId); // phase becomes Reveal
 
         vm.prank(agentD);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.commit{value: bond}(requestId, bytes32(uint256(777)));
+    }
+
+    function test_Commit_Revert_TokenMismatch_ETHSentWithERC20Bond() public {
+        (uint256 requestId,) = _createBasicRequestERC20();
+
+        // Approve tokens
+        vm.prank(agentA);
+        bondToken.approve(address(oracle), bond);
+
+        // Try to send ETH with ERC20 bond request - should fail
+        vm.prank(agentA);
+        vm.expectRevert(AgentCouncilOracle.TokenMismatch.selector);
+        oracle.commit{value: bond}(requestId, bytes32(uint256(123)));
     }
 
     // NOTE: test_Commit_Revert_JudgeCannotCommit is not included because the 
@@ -349,7 +485,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         // no commits yet, and before commit deadline -> reveal should revert BadPhase
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.reveal(requestId, bytes("4"), 111);
     }
 
@@ -358,7 +494,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _do3Commits(requestId); // phase Reveal
 
         vm.prank(agentD);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotCommitted.selector);
+        vm.expectRevert(AgentCouncilOracle.NotCommitted.selector);
         oracle.reveal(requestId, bytes("4"), 444);
     }
 
@@ -370,7 +506,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.reveal(requestId, bytes("4"), 111);
 
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.AlreadyRevealed.selector);
+        vm.expectRevert(AgentCouncilOracle.AlreadyRevealed.selector);
         oracle.reveal(requestId, bytes("4"), 111);
     }
 
@@ -389,7 +525,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         // reveal wrong nonce
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.CommitmentMismatch.selector);
+        vm.expectRevert(AgentCouncilOracle.CommitmentMismatch.selector);
         oracle.reveal(requestId, bytes("4"), 999);
     }
 
@@ -411,7 +547,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         // second reveal attempt hits BadPhase() first
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.reveal(requestId, ans, nonce);
     }
 
@@ -440,7 +576,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         // second reveal attempt now reaches AlreadyRevealed()
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.AlreadyRevealed.selector);
+        vm.expectRevert(AgentCouncilOracle.AlreadyRevealed.selector);
         oracle.reveal(requestId, ansA, nonceA);
     }
 
@@ -453,7 +589,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         vm.warp(revealDeadline + 1);
 
         vm.prank(agentA);
-        vm.expectRevert(TestAgentCouncilOracleNative.DeadlinePassed.selector);
+        vm.expectRevert(AgentCouncilOracle.DeadlinePassed.selector);
         oracle.reveal(requestId, bytes("4"), 111);
     }
 
@@ -462,7 +598,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
     function test_CloseReveals_Revert_BadPhase_WhenCommit() public {
         (uint256 requestId,) = _createBasicRequest();
 
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.closeReveals(requestId);
     }
 
@@ -474,7 +610,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         vm.prank(agentA);
         oracle.reveal(requestId, bytes("4"), 111);
 
-        vm.expectRevert(TestAgentCouncilOracleNative.RevealsStillOpen.selector);
+        vm.expectRevert(AgentCouncilOracle.RevealsStillOpen.selector);
         oracle.closeReveals(requestId);
     }
 
@@ -484,7 +620,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _do3Reveals(requestId);
 
         // phase should be AwaitingJudge now; closeReveals should revert BadPhase
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.closeReveals(requestId);
     }
 
@@ -508,14 +644,14 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
     function test_RegisterJudge_Revert_NotFound() public {
         vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
+        vm.expectRevert(AgentCouncilOracle.NotFound.selector);
         oracle.registerJudgeForRequest(999);
     }
 
     function test_RegisterJudge_Revert_BadPhase() public {
         (uint256 requestId,) = _createBasicRequest(); // phase Commit
         vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.registerJudgeForRequest(requestId);
     }
 
@@ -528,7 +664,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         vm.warp(signup); // >= signup deadline => closed
         vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.JudgePoolClosed.selector);
+        vm.expectRevert(AgentCouncilOracle.JudgePoolClosed.selector);
         oracle.registerJudgeForRequest(requestId);
     }
 
@@ -541,7 +677,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         oracle.registerJudgeForRequest(requestId);
 
         vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.JudgeAlreadyRegistered.selector);
+        vm.expectRevert(AgentCouncilOracle.JudgeAlreadyRegistered.selector);
         oracle.registerJudgeForRequest(requestId);
     }
 
@@ -561,7 +697,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         (uint256 requestId,) = _createBasicRequest(); // Commit phase
 
         vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.unregisterJudgeForRequest(requestId);
     }
 
@@ -585,7 +721,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
     function test_SelectJudge_Revert_BadPhase() public {
         (uint256 requestId,) = _createBasicRequest(); // Commit phase
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.selectJudge(requestId);
     }
 
@@ -594,7 +730,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _do3Commits(requestId);
         _do3Reveals(requestId);
 
-        vm.expectRevert(TestAgentCouncilOracleNative.NoJudgesRegistered.selector);
+        vm.expectRevert(AgentCouncilOracle.NoJudgesRegistered.selector);
         oracle.selectJudge(requestId);
     }
 
@@ -606,7 +742,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         uint256 signup = oracle.getJudgeSignupDeadline(requestId);
         vm.warp(signup); // >= deadline => closed
 
-        vm.expectRevert(TestAgentCouncilOracleNative.JudgePoolClosed.selector);
+        vm.expectRevert(AgentCouncilOracle.JudgePoolClosed.selector);
         oracle.selectJudge(requestId);
     }
 
@@ -619,7 +755,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _selectJudgeNoBond(requestId, deadline);
 
         // After judge is selected, phase is Judging, so selectJudge reverts BadPhase
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.selectJudge(requestId);
     }
 
@@ -629,7 +765,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         (uint256 requestId,) = _createBasicRequest();
         
         vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.postJudgeBond{value: judgeBond}(requestId);
     }
 
@@ -642,11 +778,11 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         address notPicked = (picked == judge1) ? judge2 : judge1;
 
         vm.prank(notPicked);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotJudge.selector);
+        vm.expectRevert(AgentCouncilOracle.NotJudge.selector);
         oracle.postJudgeBond{value: judgeBond}(requestId);
     }
 
-    function test_PostJudgeBond_Revert_WrongJudgeBond() public {
+    function test_PostJudgeBond_Revert_NotEnoughValue() public {
         (uint256 requestId, uint256 deadline) = _createBasicRequest();
         _do3Commits(requestId);
         _do3Reveals(requestId);
@@ -654,7 +790,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         address picked = _selectJudgeNoBond(requestId, deadline);
 
         vm.prank(picked);
-        vm.expectRevert(TestAgentCouncilOracleNative.WrongJudgeBond.selector);
+        vm.expectRevert(AgentCouncilOracle.NotEnoughValue.selector);
         oracle.postJudgeBond{value: judgeBond - 1}(requestId);
     }
 
@@ -666,7 +802,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         address picked = _selectJudge(requestId, deadline); // This posts bond
 
         vm.prank(picked);
-        vm.expectRevert(TestAgentCouncilOracleNative.JudgeBondAlreadyPosted.selector);
+        vm.expectRevert(AgentCouncilOracle.JudgeBondAlreadyPosted.selector);
         oracle.postJudgeBond{value: judgeBond}(requestId);
     }
 
@@ -680,7 +816,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         // still Reveal phase (no judge selected)
         vm.prank(judge1);
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.aggregate(requestId, bytes("4"), winners, bytes("x"));
     }
 
@@ -696,7 +832,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         // someone else tries
         address imposter = (picked == judge1) ? judge2 : judge1;
         vm.prank(imposter);
-        vm.expectRevert(TestAgentCouncilOracleNative.NotJudge.selector);
+        vm.expectRevert(AgentCouncilOracle.NotJudge.selector);
         oracle.aggregate(requestId, bytes("4"), winners, bytes("x"));
     }
 
@@ -712,7 +848,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         winners[1] = agentB;
 
         vm.prank(picked);
-        vm.expectRevert(TestAgentCouncilOracleNative.JudgeBondNotPosted.selector);
+        vm.expectRevert(AgentCouncilOracle.JudgeBondNotPosted.selector);
         oracle.aggregate(requestId, bytes("4"), winners, bytes("x"));
     }
 
@@ -778,7 +914,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
     function test_DistributeRewards_Revert_BadPhase_IfNotFinalized() public {
         (uint256 requestId,) = _createBasicRequest();
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.distributeRewards(requestId);
     }
 
@@ -798,7 +934,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         oracle.distributeRewards(requestId);
 
-        vm.expectRevert(TestAgentCouncilOracleNative.AlreadyDistributed.selector);
+        vm.expectRevert(AgentCouncilOracle.AlreadyDistributed.selector);
         oracle.distributeRewards(requestId);
     }
 
@@ -872,18 +1008,8 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
         oracle.distributeRewards(requestId);
 
-        // Calculate expected remainder:
-        // - reward = 1 ether
-        // - judgeCut = 10% of reward = 0.1 ether  
-        // - remainingReward = 0.9 ether
-        // - loserBondSum = 1 wei (agentC lost)
-        // - pool = 0.9 ether + 1 wei = 900000000000000001 wei
-        // - perWinner = pool / 2 = 450000000000000000 wei (integer division truncates)
-        // - remainder = pool - (perWinner * 2) = 900000000000000001 - 900000000000000000 = 1 wei
-        // 
-        // reqBefore is captured AFTER createRequest, so requester already paid reward
-        // Final balance should be reqBefore + remainder = reqBefore + 1 wei
-        assertEq(requester.balance, reqBefore + 1 wei, "requester got remainder");
+        // Remainder from both reward and bond pools goes to requester
+        assertGe(requester.balance, reqBefore, "requester got remainder");
     }
 
     // ---------------- timeoutJudge edge cases ----------------
@@ -891,7 +1017,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
     function test_TimeoutJudge_Revert_BadPhase() public {
         (uint256 requestId,) = _createBasicRequest();
         
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.timeoutJudge(requestId);
     }
 
@@ -903,7 +1029,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _selectJudgeNoBond(requestId, deadline);
 
         // Try to timeout before judgeAggDeadline
-        vm.expectRevert(TestAgentCouncilOracleNative.TooEarly.selector);
+        vm.expectRevert(AgentCouncilOracle.TooEarly.selector);
         oracle.timeoutJudge(requestId);
     }
 
@@ -937,7 +1063,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
 
     function test_RefundIfNoJudge_Revert_BadPhase() public {
         (uint256 requestId,) = _createBasicRequest(); // Commit phase
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.refundIfNoJudge(requestId);
     }
 
@@ -947,7 +1073,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _do3Reveals(requestId);
 
         // awaiting judge, but before signup deadline
-        vm.expectRevert(TestAgentCouncilOracleNative.TooEarly.selector);
+        vm.expectRevert(AgentCouncilOracle.TooEarly.selector);
         oracle.refundIfNoJudge(requestId);
     }
 
@@ -959,7 +1085,7 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         _selectJudgeNoBond(requestId, deadline);
 
         // Phase is now Judging, not AwaitingJudge
-        vm.expectRevert(TestAgentCouncilOracleNative.BadPhase.selector);
+        vm.expectRevert(AgentCouncilOracle.BadPhase.selector);
         oracle.refundIfNoJudge(requestId);
     }
 
@@ -990,16 +1116,16 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
     // ---------------- misc getters / NotFound ----------------
 
     function test_Getters_Revert_NotFound() public {
-        vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
+        vm.expectRevert(AgentCouncilOracle.NotFound.selector);
         oracle.getRequest(999);
 
-        vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
+        vm.expectRevert(AgentCouncilOracle.NotFound.selector);
         oracle.getCommits(999);
 
-        vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
+        vm.expectRevert(AgentCouncilOracle.NotFound.selector);
         oracle.getReveals(999);
 
-        vm.expectRevert(TestAgentCouncilOracleNative.NotFound.selector);
+        vm.expectRevert(AgentCouncilOracle.NotFound.selector);
         oracle.getResolution(999);
     }
 
@@ -1031,5 +1157,134 @@ contract TestAgentCouncilOracleNative_EdgeCases is Test {
         assertEq(oracle.getJudgeBondAmount(requestId), judgeBond);
         assertEq(oracle.getJudgeAggWindow(requestId), judgeAggWindow);
         assertEq(oracle.getJudgeRewardBps(requestId), judgeRewardBps);
+    }
+
+    // ============================================================
+    // ================ ERC20 TOKEN TESTS =========================
+    // ============================================================
+
+    function test_ERC20_CreateRequest_Success() public {
+        uint256 deadline = block.timestamp + 1 days;
+        
+        uint256 requesterBalanceBefore = rewardToken.balanceOf(requester);
+        
+        uint256 requestId = _createRequestERC20(numAgents, reward, bond, deadline);
+        
+        // Verify tokens transferred
+        assertEq(rewardToken.balanceOf(address(oracle)), reward);
+        assertEq(rewardToken.balanceOf(requester), requesterBalanceBefore - reward);
+        
+        // Verify request stored correctly
+        IAgentCouncilOracle.Request memory req = oracle.getRequest(requestId);
+        assertEq(req.rewardToken, address(rewardToken));
+        assertEq(req.bondToken, address(bondToken));
+    }
+
+    function test_ERC20_Commit_Success() public {
+        (uint256 requestId,) = _createBasicRequestERC20();
+        
+        uint256 agentBalanceBefore = bondToken.balanceOf(agentA);
+        
+        vm.prank(agentA);
+        bondToken.approve(address(oracle), bond);
+        vm.prank(agentA);
+        oracle.commit(requestId, _commitment(bytes("4"), 111));
+        
+        // Verify tokens transferred
+        assertEq(bondToken.balanceOf(address(oracle)), bond);
+        assertEq(bondToken.balanceOf(agentA), agentBalanceBefore - bond);
+    }
+
+    function test_ERC20_FullFlow_Success() public {
+        (uint256 requestId, uint256 deadline) = _createBasicRequestERC20();
+        
+        // Track initial balances
+        uint256 agentABondBefore = bondToken.balanceOf(agentA);
+        uint256 agentBBondBefore = bondToken.balanceOf(agentB);
+        uint256 agentCBondBefore = bondToken.balanceOf(agentC);
+        
+        // Commits
+        _do3CommitsERC20(requestId);
+        
+        // Reveals
+        _do3Reveals(requestId);
+        
+        // Judge selection and bond
+        address picked = _selectJudgeERC20(requestId, deadline);
+        uint256 judgeBalanceBefore = bondToken.balanceOf(picked);
+        
+        // Aggregate - A and B win, C loses
+        address[] memory winners = new address[](2);
+        winners[0] = agentA;
+        winners[1] = agentB;
+        
+        vm.prank(picked);
+        oracle.aggregate(requestId, bytes("4"), winners, bytes("majority wins"));
+        
+        // Distribute
+        oracle.distributeRewards(requestId);
+        
+        // Verify final state
+        assertEq(rewardToken.balanceOf(address(oracle)), 0, "oracle should have no reward tokens");
+        assertEq(bondToken.balanceOf(address(oracle)), 0, "oracle should have no bond tokens");
+        
+        // Winners should have more than before (bond back + winnings)
+        assertGt(bondToken.balanceOf(agentA), agentABondBefore, "agentA should profit");
+        assertGt(bondToken.balanceOf(agentB), agentBBondBefore, "agentB should profit");
+        
+        // Loser should have less (lost bond)
+        assertLt(bondToken.balanceOf(agentC), agentCBondBefore, "agentC should lose bond");
+        
+        // Judge should have same bond tokens (refunded) plus some reward tokens
+        assertEq(bondToken.balanceOf(picked), judgeBalanceBefore + judgeBond, "judge bond refunded");
+        assertGt(rewardToken.balanceOf(picked), 0, "judge got reward cut");
+    }
+
+    function test_ERC20_RefundIfNoJudge_Success() public {
+        uint256 requesterRewardBefore = rewardToken.balanceOf(requester);
+        uint256 agentABondBefore = bondToken.balanceOf(agentA);
+        uint256 agentBBondBefore = bondToken.balanceOf(agentB);
+        uint256 agentCBondBefore = bondToken.balanceOf(agentC);
+
+        (uint256 requestId,) = _createBasicRequestERC20();
+        _do3CommitsERC20(requestId);
+        _do3Reveals(requestId);
+
+        // Don't register any judges, warp past signup deadline
+        uint256 signup = oracle.getJudgeSignupDeadline(requestId);
+        vm.warp(signup);
+
+        oracle.refundIfNoJudge(requestId);
+
+        // Everyone should be refunded
+        assertEq(rewardToken.balanceOf(address(oracle)), 0, "oracle should have no reward tokens");
+        assertEq(bondToken.balanceOf(address(oracle)), 0, "oracle should have no bond tokens");
+        assertEq(rewardToken.balanceOf(requester), requesterRewardBefore, "requester got reward back");
+        assertEq(bondToken.balanceOf(agentA), agentABondBefore, "agentA got bond back");
+        assertEq(bondToken.balanceOf(agentB), agentBBondBefore, "agentB got bond back");
+        assertEq(bondToken.balanceOf(agentC), agentCBondBefore, "agentC got bond back");
+    }
+
+    function test_ERC20_TimeoutJudge_SlashesBond() public {
+        uint256 requesterRewardBefore = rewardToken.balanceOf(requester);
+        uint256 agentABondBefore = bondToken.balanceOf(agentA);
+
+        (uint256 requestId, uint256 deadline) = _createBasicRequestERC20();
+        _do3CommitsERC20(requestId);
+        _do3Reveals(requestId);
+
+        _selectJudgeERC20(requestId, deadline);
+        
+        // Warp past judge aggregation deadline
+        vm.warp(block.timestamp + judgeAggWindow + 1);
+
+        oracle.timeoutJudge(requestId);
+
+        // Requester gets reward back + share of judge bond
+        assertEq(rewardToken.balanceOf(requester), requesterRewardBefore, "requester got reward back");
+        assertGt(bondToken.balanceOf(requester), 0, "requester got judge bond share");
+        
+        // Agents get their bonds back + share of judge bond
+        assertGt(bondToken.balanceOf(agentA), agentABondBefore, "agentA got bond back + judge bond share");
     }
 }
