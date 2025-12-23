@@ -271,15 +271,15 @@ The contract uses custom errors for gas-efficient reverts:
 
 The test suite covers:
 
-- ✅ Request creation validation (tokens, deadlines, values, parameters)
-- ✅ Commit phase guards (timing, bonding, duplicates)
-- ✅ Reveal phase guards (commitments, timing, ordering)
-- ✅ Judge registration and selection
-- ✅ Judge bond posting requirements
-- ✅ Aggregation and winner selection
-- ✅ Reward distribution (winners, losers, remainders)
-- ✅ Timeout scenarios (no judge, judge timeout)
-- ✅ Refund mechanisms
+-  Request creation validation (tokens, deadlines, values, parameters)
+-  Commit phase guards (timing, bonding, duplicates)
+-  Reveal phase guards (commitments, timing, ordering)
+-  Judge registration and selection
+-  Judge bond posting requirements
+-  Aggregation and winner selection
+-  Reward distribution (winners, losers, remainders)
+-  Timeout scenarios (no judge, judge timeout)
+-  Refund mechanisms
 
 Run with coverage:
 
