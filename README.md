@@ -18,6 +18,7 @@ The Agent Council Oracle enables trustless information resolution by:
 - **Decentralized Judging**: Judges register for requests and are randomly selected
 - **Configurable Parameters**: Reward amounts, bond sizes, time windows, and judge compensation are all customizable per-request
 - **Timeout Protection**: Automatic refunds if judges fail to act within deadlines
+- **Flexible Token Support**: Supports native ETH or any ERC20 token for rewards and bonds (can be different tokens)
 
 ## Architecture
 
@@ -136,12 +137,17 @@ params.revealWindow = 1 hours;      // Time for reveals after commit deadline
 params.judgeBondAmount = 0.1 ether; // Bond required from judge
 params.judgeAggWindow = 1 hours;    // Time for judge to aggregate
 params.judgeRewardBps = 1000;       // 10% of reward to judge (basis points)
-params.rewardToken = address(0);    // Native ETH only
-params.bondToken = address(0);      // Native ETH only
+params.rewardToken = address(0);    // address(0) for native ETH, or ERC20 token address
+params.bondToken = address(0);      // address(0) for native ETH, or ERC20 token address
 params.specifications = "Return price in USD";
 params.requiredCapabilities = capabilities;
 
+// For native ETH rewards:
 uint256 requestId = oracle.createRequest{value: 1 ether}(params);
+
+// For ERC20 rewards (must approve first):
+// IERC20(rewardToken).approve(address(oracle), rewardAmount);
+// uint256 requestId = oracle.createRequest(params);  // no ETH sent
 ```
 
 ### Participating as an Agent
@@ -151,7 +157,13 @@ uint256 requestId = oracle.createRequest{value: 1 ether}(params);
 bytes memory answer = bytes("4500");
 uint256 nonce = 12345; // Keep this secret!
 bytes32 commitment = keccak256(abi.encode(answer, nonce));
+
+// For native ETH bonds:
 oracle.commit{value: 0.1 ether}(requestId, commitment);
+
+// For ERC20 bonds (must approve first):
+// IERC20(bondToken).approve(address(oracle), bondAmount);
+// oracle.commit(requestId, commitment);  // no ETH sent
 
 // 2. Reveal (after commit phase ends)
 oracle.reveal(requestId, answer, nonce);
@@ -167,7 +179,10 @@ oracle.registerJudgeForRequest(requestId);
 oracle.selectJudge(requestId);
 
 // 3. If selected, post bond
+// For native ETH:
 oracle.postJudgeBond{value: 0.1 ether}(requestId);
+// For ERC20 (must approve first):
+// oracle.postJudgeBond(requestId);
 
 // 4. Aggregate answers and pick winners
 address[] memory winners = new address[](2);
@@ -217,12 +232,15 @@ The contract uses custom errors for gas-efficient reverts:
 | `NotFound` | Request ID doesn't exist |
 | `BadPhase` | Action not allowed in current phase |
 | `DeadlinePassed` | Commit/reveal deadline exceeded |
-| `NotEnoughValue` | Insufficient ETH sent |
+| `NotEnoughValue` | Insufficient ETH sent (for native ETH transfers) |
 | `AlreadyCommitted` | Agent already committed to this request |
 | `CommitmentMismatch` | Revealed answer doesn't match commitment |
 | `NotJudge` | Caller is not the selected judge |
 | `JudgeBondNotPosted` | Judge trying to aggregate without posting bond |
 | `NoJudgesRegistered` | No judges available for selection |
+| `TokenMismatch` | Sent ETH when using ERC20 tokens (or vice versa) |
+| `RewardTransferFailed` | ERC20 reward transfer failed |
+| `BondTransferFailed` | ERC20 bond transfer failed |
 
 ## Safety Features
 
@@ -240,12 +258,12 @@ The contract uses custom errors for gas-efficient reverts:
 
 ```
 ├── src/
-│   └── TestAgentCouncilOracleNative.sol   # Main contract
+│   └── AgentCouncilOracle.sol          # Main contract (ETH + ERC20 support)
 ├── script/
-│   └── OracleDemo.s.sol                    # Interactive demo
+│   └── OracleDemo.s.sol                # Interactive demo (uses native ETH)
 ├── test/
-│   └── TestAgentCouncilOracleNative.edge.t.sol  # Edge case tests
-├── foundry.toml                            # Foundry configuration
+│   └── AgentCouncilOracle.t.sol        # Edge case tests
+├── foundry.toml                        # Foundry configuration
 └── README.md
 ```
 
@@ -275,9 +293,13 @@ forge coverage
 
 2. **Front-running**: The commit-reveal scheme prevents answer copying, but commit transactions themselves are visible in the mempool.
 
-3. **Native ETH Only**: This version only supports native ETH for rewards and bonds. ERC20 support would require additional security review.
+3. **ERC20 Tokens**: When using ERC20 tokens, ensure the token contract is trusted. Malicious or fee-on-transfer tokens may cause unexpected behavior. The contract assumes standard ERC20 behavior.
 
-4. **Reentrancy**: The contract uses checks-effects-interactions pattern and should be safe, but has not been formally audited.
+4. **Token Approvals**: Users must approve the oracle contract to spend their tokens before creating requests or committing with ERC20 bonds.
+
+5. **Mixed Token Scenarios**: Rewards and bonds can use different tokens. Winners receive their share of rewards in `rewardToken` and slashed bonds in `bondToken`.
+
+6. **Reentrancy**: The contract uses checks-effects-interactions pattern and should be safe, but has not been formally audited.
 
 ## License
 
